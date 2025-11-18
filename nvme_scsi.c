@@ -244,6 +244,18 @@ nvme_scsi_inquiry(nvme_soft_t *soft, scsi_request_t *req)
         }
 
         bcopy(inquiry_data, buffer, copy_len);
+        {
+            uint_t csts;
+            cmn_err(CE_WARN, "nvme: outstanding reqs: %d,%d", soft->admin_queue.outstanding, soft->io_queue.outstanding);
+            csts = NVME_RD(soft, NVME_REG_CSTS);
+            cmn_err(CE_WARN, "CSTS (0x1C): 0x%08x", csts);
+            cmn_err(CE_CONT, "  RDY (Ready):                 %u %s",
+                    csts & 1, (csts & 1) ? "[READY]" : "[NOT READY]");
+            cmn_err(CE_CONT, "  CFS (Controller Fatal):      %u %s",
+                    (csts >> 1) & 1, ((csts >> 1) & 1) ? "[FATAL ERROR!]" : "[OK]");
+            cmn_err(CE_CONT, "  SHST (Shutdown Status):      %u", (csts >> 2) & 3);
+            cmn_err(CE_CONT, "  NSSRO (NVM Subsys Reset):    %u", (csts >> 4) & 1);
+        }
     }
 
     nvme_set_success(req);
@@ -471,7 +483,7 @@ nvme_scsi_sync_cache(nvme_soft_t *soft, scsi_request_t *req)
 #ifdef NVME_DBG
         cmn_err(CE_WARN, "nvme_scsi_sync_cache: failed to submit flush command");
 #endif
-        nvme_io_cid_done(soft, cid);
+        nvme_io_cid_done(soft, cid, NULL);
         nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
         return -1;
     }
@@ -480,38 +492,151 @@ nvme_scsi_sync_cache(nvme_soft_t *soft, scsi_request_t *req)
     return 0;
 }
 
+int
+nvme_parse_rw(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
+{
+    u_char *cdb = ps->req->sr_command;
+
+    switch (cdb[0]) {
+    case SCSIOP_READ_6:
+    case SCSIOP_WRITE_6:
+        /* READ(6)/WRITE(6) format:
+         * Byte 0: Opcode
+         * Byte 1: LBA bits 20-16 (5 bits) in bits 4-0
+         * Byte 2: LBA bits 15-8
+         * Byte 3: LBA bits 7-0
+         * Byte 4: Transfer length (0 = 256 blocks)
+         * Byte 5: Control
+         */
+        ps->lba = ((__uint64_t)(cdb[1] & 0x1F) << 16) |
+                  ((__uint64_t)cdb[2] << 8) |
+                  ((__uint64_t)cdb[3]);
+        ps->num_blocks = cdb[4];
+        if (ps->num_blocks == 0) {
+            ps->num_blocks = 256;  /* 0 means 256 blocks in READ(6)/WRITE(6) */
+        }
+        if (cdb[0] == SCSIOP_WRITE_6)
+            ps->flags |= NF_WRITE;
+        break;
+
+    case SCSIOP_READ_10:
+    case SCSIOP_WRITE_10:
+        /* READ(10)/WRITE(10) format:
+         * Byte 0: Opcode
+         * Byte 1: Flags
+         * Byte 2: LBA bits 31-24
+         * Byte 3: LBA bits 23-16
+         * Byte 4: LBA bits 15-8
+         * Byte 5: LBA bits 7-0
+         * Byte 6: Reserved
+         * Byte 7: Transfer length bits 15-8
+         * Byte 8: Transfer length bits 7-0
+         * Byte 9: Control
+         */
+        ps->lba = ((__uint64_t)cdb[2] << 24) |
+                  ((__uint64_t)cdb[3] << 16) |
+                  ((__uint64_t)cdb[4] << 8) |
+                  ((__uint64_t)cdb[5]);
+        ps->num_blocks = ((uint_t)cdb[7] << 8) | ((uint_t)cdb[8]);
+        if (cdb[0] == SCSIOP_WRITE_10)
+            ps->flags |= NF_WRITE;
+        break;
+
+    case SCSIOP_READ_16:
+    case SCSIOP_WRITE_16:
+        /* READ(16)/WRITE(16) format:
+         * Byte 0: Opcode
+         * Byte 1: Flags
+         * Byte 2: LBA bits 63-56
+         * Byte 3: LBA bits 55-48
+         * Byte 4: LBA bits 47-40
+         * Byte 5: LBA bits 39-32
+         * Byte 6: LBA bits 31-24
+         * Byte 7: LBA bits 23-16
+         * Byte 8: LBA bits 15-8
+         * Byte 9: LBA bits 7-0
+         * Byte 10: Transfer length bits 31-24
+         * Byte 11: Transfer length bits 23-16
+         * Byte 12: Transfer length bits 15-8
+         * Byte 13: Transfer length bits 7-0
+         * Byte 14: Flags
+         * Byte 15: Control
+         */
+        ps->lba = ((__uint64_t)cdb[2] << 56) |
+                  ((__uint64_t)cdb[3] << 48) |
+                  ((__uint64_t)cdb[4] << 40) |
+                  ((__uint64_t)cdb[5] << 32) |
+                  ((__uint64_t)cdb[6] << 24) |
+                  ((__uint64_t)cdb[7] << 16) |
+                  ((__uint64_t)cdb[8] << 8) |
+                  ((__uint64_t)cdb[9]);
+        ps->num_blocks = ((uint_t)cdb[10] << 24) |
+                         ((uint_t)cdb[11] << 16) |
+                         ((uint_t)cdb[12] << 8) |
+                         ((uint_t)cdb[13]);
+        if (cdb[0] == SCSIOP_WRITE_16)
+            ps->flags |= NF_WRITE;
+        break;
+
+    default:
+        cmn_err(CE_WARN, "nvme_parse_rw: unsupported CDB opcode 0x%02x",
+                cdb[0]);
+        return 0;
+    }
+
+    return 1;
+}
+
+
 /*
  * nvme_scsi_read_write: Handle READ/WRITE commands
  */
-int
-nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req, int is_write)
+void
+nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req)
 {
-    nvme_command_t cmd;
-    unsigned int cid;
-    unsigned int cid_array[64];  /* Support up to 64 commands for very large transfers */
-    unsigned int commands;
-    unsigned int cidx, j;
-    alenlist_t alenlist;
-    int need_unlock;
+    nvme_rwcmd_state_t s;
     int rc;
 
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme_scsi_read_write: ENTRY buflen=%d buffer=%p flags=0x%x tag=%d",
-            req->sr_buflen, req->sr_buffer, req->sr_flags, req->sr_tag);
-#endif
     /* Reject zero-length transfers */
     if (req->sr_buflen == 0) {
 #ifdef NVME_DBG
         cmn_err(CE_WARN, "nvme_scsi_read_write: zero-length transfer rejected");
 #endif
         nvme_set_success(req);
-        req->sr_resid = 0;
         if (req->sr_notify) {
             req->sr_ha = NULL;
             (*req->sr_notify)(req);
         }
-        return 0;
+        return;
     }
+
+    /* Initialize refcount atomically to 1 (will be incremented by nvme_io_cid_alloc) */
+    *(volatile int *)&(req->sr_ha) = 1;
+
+    /* Initialize SCSI status to success (errors will override this) */
+    nvme_set_success(req);
+
+    s.req = req;
+    s.buflen = req->sr_buflen;
+    s.flags = 0;
+    s.max_transfer_blocks = soft->max_transfer_blocks;
+    if (!nvme_parse_rw(soft, &s)) {
+        nvme_set_adapter_error(req);
+        goto error;
+    }
+
+    /* Check if this is a retry of an aborted command */
+    if (nvme_aborted_fifo_find_and_remove(soft, &s)) {
+        s.flags |= NF_RETRY;
+        s.max_transfer_blocks = 1;
+        cmn_err(CE_WARN, "nvme_scsi_read_write: RETRY DETECTED buflen=%u buffer=%p bp=%p sr_flags=0x%x nf_flags=0x%x",
+                req->sr_buflen, req->sr_buffer, req->sr_bp, req->sr_flags, s.flags);
+    }
+
+#ifdef NVME_DBG
+    cmn_err(CE_NOTE, "nvme_scsi_read_write: ENTRY buflen=%d buffer=%p flags=0x%x tag=%d",
+            req->sr_buflen, req->sr_buffer, req->sr_flags, req->sr_tag);
+#endif
 
     /*
      * For ordered or head-of-queue tagged commands, issue a special flush first
@@ -530,114 +655,113 @@ nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req, int is_write)
         }
     }
 
-    if (req->sr_buflen > soft->max_transfer_blocks * soft->block_size) {
-        commands = (req->sr_buflen + soft->max_transfer_blocks * soft->block_size - 1) / (soft->max_transfer_blocks * soft->block_size);
+    if (req->sr_buflen > s.max_transfer_blocks * soft->block_size) {
+        s.commands = (req->sr_buflen + s.max_transfer_blocks * soft->block_size - 1) / (s.max_transfer_blocks * soft->block_size);
     } else {
-        commands = 1;
+        s.commands = 1;
     }
-
     /* Prepare alenlist before allocating CIDs (initializes cursor at offset 0) */
-    rc = nvme_prepare_alenlist(soft, req, &alenlist, &need_unlock);
-    if (rc != 0) {
+    rc = nvme_prepare_alenlist(soft, &s);
+    if (rc <= 0) {
 #ifdef NVME_DBG
         cmn_err(CE_WARN, "nvme_scsi_read_write: failed to prepare alenlist");
 #endif
-        nvme_set_adapter_error(req);
-        rc = -1;
+        if (rc == 0)
+            nvme_set_adapter_error(req);
         goto error;
     }
+    if (!s.alenlist)
+        goto error;
 
     /* Allocate CID(s) for this I/O command */
-    if (nvme_io_cid_alloc(soft, req, commands, cid_array) != 0) {
+    if (nvme_io_cid_alloc(soft, req, s.commands, s.cids) != 0) {
 #ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_read_write: no free CIDs available (requested %u)", commands);
+        cmn_err(CE_WARN, "nvme_scsi_read_write: no free CIDs available (requested %u)", s.commands);
 #endif
         nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-        rc = -1;
         goto error_cleanup_alenlist;
     }
 
     /* Process each command/CID */
-    for (cidx = 0; cidx < commands; cidx++) {
-        cid = cid_array[cidx];
+    for (s.cidx = 0; s.cidx < s.commands; s.cidx++) {
 
         /* Build the NVMe READ/WRITE command (sets opcode, nsid, LBA, num_blocks) */
 #ifdef NVME_DBG_CMD
-        cmn_err(CE_WARN, "nvme_scsi_read_write: building NVMe command %u/%u (CID %u)...", cidx+1, commands, cid);
+        cmn_err(CE_WARN, "nvme_scsi_read_write: building NVMe command %u/%u (CID %u)...", s.cidx+1, s.commands, s.cids[s.cidx]);
 #endif
-        rc = nvme_io_build_rw_command(soft, req, &cmd, cidx);
+        rc = nvme_io_build_rw_command(soft, &s);
         if (rc <= 0) {
 #ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to build NVMe command %u", cidx);
+            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to build NVMe command %u", s.cidx);
 #endif
             if (rc == 0)
                 nvme_set_adapter_error(req);
-            rc = -1;
             goto error_cleanup_cids;
         }
 #ifdef NVME_DBG_CMD
-        cmn_err(CE_NOTE, "nvme_scsi_read_write: NVMe command %u built successfully", cidx);
+        cmn_err(CE_NOTE, "nvme_scsi_read_write: NVMe command %u built successfully", s.cidx);
 #endif
-        /* Set the CID in the command */
-        cmd.cdw0 = (cmd.cdw0 & 0x0000FFFF) | (cid << 16);
 
         /* Build PRP entries for data transfer (sets prp1/prp2, allocates PRP list if needed) */
 #ifdef NVME_DBG_CMD
-        cmn_err(CE_NOTE, "nvme_scsi_read_write: building PRPs for command %u...", cidx);
+        cmn_err(CE_NOTE, "nvme_scsi_read_write: building PRPs for command %u...", s.cidx);
 #endif
-        rc = nvme_build_prps_from_alenlist(soft, req, &cmd, alenlist, cidx, is_write);
+        rc = nvme_build_prps_from_alenlist(soft, &s);
         if (rc <= 0) {
 #ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to build PRPs for command %u (rc=%d)", cidx, rc);
+            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to build PRPs for command %u (rc=%d)", s.cidx, rc);
 #endif
             if (rc == 0) {
                 /* Hard error - set adapter error */
                 nvme_set_adapter_error(req);
             }
             /* rc == -1: BUSY already set by nvme_build_prps_from_alenlist */
-            rc = -1;
             goto error_cleanup_cids;
         }
 #ifdef NVME_DBG_CMD
         cmn_err(CE_NOTE, "nvme_scsi_read_write: PRPs built successfully for command %u, prp1=0x%x%08x prp2=0x%x%08x blocks=%u",
-                cidx, cmd.prp1_hi, cmd.prp1_lo, cmd.prp2_hi, cmd.prp2_lo, cmd.cdw12+1);
+                s.cidx, s.cmd.prp1_hi, s.cmd.prp1_lo, s.cmd.prp2_hi, s.cmd.prp2_lo, s.cmd.cdw12+1);
 #endif
         /* Submit the command to the I/O queue */
 #ifdef NVME_DBG_CMD
-        cmn_err(CE_WARN, "nvme_scsi_read_write: submitting NVMe command %u/%u (CID=%d)...", cidx+1, commands, cid);
+        cmn_err(CE_WARN, "nvme_scsi_read_write: submitting NVMe command %u/%u (CID=%d)...", s.cidx+1, s.commands, s.cids[s.cidx]);
 #endif
-        rc = nvme_submit_cmd(soft, &soft->io_queue, &cmd);
+        rc = nvme_submit_cmd(soft, &soft->io_queue, &s.cmd);
         if (rc != 0) {
 #ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to submit command %u", cidx);
+            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to submit command %u", s.cidx);
 #endif
             nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-            rc = -1;
             goto error_cleanup_cids;
         }
 #ifdef NVME_DBG_CMD
-        cmn_err(CE_WARN, "nvme_scsi_read_write: command %u/%u submitted to SQ, tail now at %d", cidx+1, commands, soft->io_queue.sq_tail);
+        cmn_err(CE_WARN, "nvme_scsi_read_write: command %u/%u submitted to SQ, tail now at %d", s.cidx+1, s.commands, soft->io_queue.sq_tail);
 #endif
     }
 
-    /* All commands submitted successfully - clean up alenlist */
-    nvme_cleanup_alenlist(soft, need_unlock);
-
-    /* Completions will be handled by interrupt */
-    return 0;
-
 error_cleanup_cids:
-    /* Clean up all allocated CIDs */
-    for (j = 0; j < commands; j++) {
-        nvme_io_cid_done(soft, cid_array[j]);
+    {
+        unsigned int j;
+        /* Clean up all allocated CIDs */
+        for (j = s.cidx; j < s.commands; j++) {
+            nvme_io_cid_done(soft, s.cids[j], NULL);
+        }
     }
-
 error_cleanup_alenlist:
     /* Clean up alenlist */
-    nvme_cleanup_alenlist(soft, need_unlock);
+    nvme_cleanup_alenlist(soft, s.need_unlock);
 
 error:
-    return rc;
+    /* Atomically decrement refcount by 1 (for the initial +1 at start) */
+    /* If refcount reaches 0, all commands completed before we got here - call sr_notify
+     * sr_ha is already 0 (NULL) from the atomic decrement
+     */
+    if (atomicAddInt((int *)&req->sr_ha, -1) == 0) {
+        /* All commands already completed - notify now */
+        if (req->sr_notify) {
+            (*req->sr_notify)(req);
+        }
+    }
 }
 
 /*
@@ -730,21 +854,16 @@ nvme_scsi_command(scsi_request_t *req)
 #ifdef NVME_DBG
         cmn_err(CE_NOTE, "nvme_scsi_command: READ command - calling read_write handler");
 #endif
-        rc = nvme_scsi_read_write(soft, req, 0);
-        if (rc == 0)
-            return;
-        break;
-
+        nvme_scsi_read_write(soft, req);
+        return; // notify always called by nvme_scsi_read_write
     case SCSIOP_WRITE_6:
     case SCSIOP_WRITE_10:
     case SCSIOP_WRITE_16:
 #ifdef NVME_DBG
         cmn_err(CE_WARN, "nvme_scsi_command: WRITE command - calling read_write handler");
 #endif
-        rc = nvme_scsi_read_write(soft, req, 1);
-        if (rc == 0)
-            return;
-        break;
+        nvme_scsi_read_write(soft, req);
+        return; // notify always called by nvme_scsi_read_write
 
     case SCSIOP_MODE_SENSE_6:
         rc = nvme_scsi_mode_sense(soft, req);
@@ -985,4 +1104,104 @@ nvme_scsi_ioctl(vertex_hdl_t ctlr_vhdl, unsigned int cmd, struct scsi_ha_op *op)
         cmn_err(CE_WARN, "nvme_scsi_ioctl: unknown ioctl 0x%x", cmd);
         return EINVAL;
     }
+}
+
+/*
+ * nvme_aborted_fifo_add: Add an aborted command to the FIFO
+ *
+ * Stores key identifying fields from the scsi_request that remain constant
+ * across retries (CDB, buffer, flags, etc.)
+ */
+void
+nvme_aborted_fifo_add(nvme_soft_t *soft, scsi_request_t *req)
+{
+    nvme_aborted_cmd_t *entry;
+    uint_t idx;
+
+    mutex_lock(&soft->aborted_lock, PZERO);
+
+    /* Get next write position (circular FIFO, overwrites oldest) */
+    idx = soft->aborted_head;
+    soft->aborted_head = (idx + 1) % NVME_ABORT_FIFO_SIZE;
+
+    entry = &soft->aborted_cmds[idx];
+
+    /* Copy key fields that identify the request */
+    bcopy(req->sr_command, entry->cdb,
+          req->sr_cmdlen < SCSI_MAX_CDB_LEN ? req->sr_cmdlen : SCSI_MAX_CDB_LEN);
+    entry->sr_flags = req->sr_flags;
+    entry->sr_buffer = req->sr_buffer;
+    entry->sr_buflen = req->sr_buflen;
+    entry->sr_bp = req->sr_bp;
+    entry->abort_time = lbolt;
+
+    /* Mark entry as valid in bitmap */
+    soft->aborted_bitmap |= (1U << idx);
+
+    mutex_unlock(&soft->aborted_lock);
+
+#ifdef NVME_DBG
+    cmn_err(CE_NOTE, "nvme_aborted_fifo_add: stored aborted cmd at idx=%u "
+            "buffer=%p buflen=%u bp=%p flags=0x%x",
+            idx, entry->sr_buffer, entry->sr_buflen, entry->sr_bp, entry->sr_flags);
+#endif
+}
+
+/*
+ * nvme_aborted_fifo_find_and_remove: Check if request matches an aborted command
+ *
+ * Searches the FIFO for a matching entry based on CDB, buffer, buflen, bp, and flags.
+ * If found, marks the entry as invalid and returns 1 (indicating this is a retry).
+ * Otherwise returns 0 (not a retry).
+ */
+int
+nvme_aborted_fifo_find_and_remove(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
+{
+    nvme_aborted_cmd_t *entry;
+    uint_t i;
+    int found = 0;
+
+    mutex_lock(&soft->aborted_lock, PZERO);
+
+    /* Early exit if no valid entries in bitmap */
+    if (soft->aborted_bitmap == 0) {
+        mutex_unlock(&soft->aborted_lock);
+        return 0;
+    }
+
+    /* Search the entire FIFO */
+    for (i = 0; i < NVME_ABORT_FIFO_SIZE; i++) {
+        /* Skip invalid entries (check bitmap in one comparison) */
+        if (!(soft->aborted_bitmap & (1U << i))) {
+            continue;
+        }
+
+        entry = &soft->aborted_cmds[i];
+
+        /* Match on: buffer address, buflen, bp, and flags */
+        if (entry->sr_buffer == ps->req->sr_buffer &&
+            entry->sr_buflen == ps->req->sr_buflen &&
+            entry->sr_bp == ps->req->sr_bp &&
+            entry->sr_flags == ps->req->sr_flags) {
+
+            /* Also verify CDB matches (compare up to sr_cmdlen bytes) */
+            if (bcmp(entry->cdb, ps->req->sr_command,
+                     ps->req->sr_cmdlen < SCSI_MAX_CDB_LEN ? ps->req->sr_cmdlen : SCSI_MAX_CDB_LEN) == 0) {
+                /* Found a match - this is a retry */
+                /* Clear bit in bitmap to mark as invalid */
+                soft->aborted_bitmap &= ~(1U << i);
+                found = 1;
+#ifdef NVME_DBG
+                cmn_err(CE_NOTE, "nvme_aborted_fifo_find_and_remove: RETRY DETECTED at idx=%u "
+                        "buffer=%p buflen=%u bp=%p flags=0x%x",
+                        i, entry->sr_buffer, entry->sr_buflen, entry->sr_bp, entry->sr_flags);
+#endif
+                break;
+            }
+        }
+    }
+
+    mutex_unlock(&soft->aborted_lock);
+
+    return found;
 }

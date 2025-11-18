@@ -1,26 +1,37 @@
 #ifndef __NVMEDRV_H
 #define __NVMEDRV_H
 
-#define noNVME_COMPLETION_THREAD
-#define noNVME_COMPLETION_MANUAL
-#define NVME_COMPLETION_INTERRUPT
-#define noNVME_FORCE_4K
-#define noNVME_READ_BARRIER
-#define noNVME_VCHAN1
-#define noNVME_TEST
-
-#ifdef IP30
-/* IP32 can mix and match swapping regions because it is all address based
-   IP30 has endianess set per PCI slot, so everything has to be bytestream 
-*/
-#define NVME_UTILBUF_USEDMAP
-#define NVME_QUEUE_BYTESWAP
-#define noNVME_READ_BARRIER
-#endif
-
 #define noNVME_DBG
 #define noNVME_DBG_EXTRA
 #define noNVME_DBG_CMD
+
+#define noNVME_COMPLETION_THREAD
+#define noNVME_COMPLETION_MANUAL
+#define noNVME_COMPLETION_INTERRUPT
+#define noNVME_FORCE_4K
+#define noNVME_TEST
+
+/* IP32 can mix and match swapping regions because it is all address based
+   IP30 and IP35 has endianess set per PCI slot, so everything has to be bytestream 
+*/
+#ifdef IP30
+#define NVME_UTILBUF_USEDMAP
+#define NVME_QUEUE_BYTESWAP
+#define NVME_COMPLETION_INTERRUPT
+#define DMATRANS64 PCIIO_DMA_A64
+#endif
+
+#ifdef IP35
+#define NVME_COMPLETION_INTERRUPT
+#define NVME_UTILBUF_USEDMAP
+#define NVME_QUEUE_BYTESWAP
+#define DMATRANS64 PCIIO_DMA_A64
+#endif
+
+#if defined(IP32)
+#define NVME_COMPLETION_INTERRUPT
+#define DMATRANS64 0
+#endif
 
 #define NVME_UTILBUF_BSWAP
 
@@ -62,7 +73,7 @@ extern void hwgraph_link_add(   char *dest_path,
 /* PCI infrastructure */
 #include <sys/PCI/PCI_defs.h>
 #include <sys/PCI/pciio.h>
-#ifdef IP30
+#if defined(IP30) || defined(IP35)
 #include <sys/PCI/pcibr.h>
 #include <sys/PCI/bridge.h>
 #endif
@@ -96,12 +107,8 @@ void bp_heart_invalidate_war(struct buf *bp);
 #ifdef IP32
 #include <sys/IP32.h>
 #endif
-
-#if defined(IP30)
-#define DMATRANS64 PCIIO_DMA_A64
-#endif
-#if defined(IP32)
-#define DMATRANS64 0
+#ifdef IP35
+#include <sys/SN/SN1/IP35.h>
 #endif
 
 #define PAGE_SIZE NBPP
@@ -117,7 +124,9 @@ void bp_heart_invalidate_war(struct buf *bp);
  * Driver Configuration
  */
 #define NVME_ADMIN_QUEUE_SIZE   64      /* Admin queue depth */
-#define NVME_IO_QUEUE_SIZE      256     /* I/O queue depth */
+#define NVME_IO_QUEUE_SIZE      512     /* I/O queue depth */
+#define NVME_WATCHDOG_TIMEOUT_US 2000   /* Watchdog timeout in microseconds (2ms) */
+#define NVME_TIMEOUT_CHECK_INTERVAL_MS 100  /* Check for timeouts every 100ms (10 Hz) */
 
 /* SCSI CDB Operation Codes we handle */
 #define SCSIOP_TEST_UNIT_READY    0x00
@@ -147,6 +156,10 @@ void bp_heart_invalidate_war(struct buf *bp);
 #define MODE_SENSE_CHANGEABLE_VALUES    0x01
 #define MODE_SENSE_DEFAULT_VALUES       0x02
 #define MODE_SENSE_SAVED_VALUES         0x03
+
+/* NVMe internal command flags (for passing through the call stack) */
+#define NF_WRITE    0x01    /* Command is a write operation */
+#define NF_RETRY    0x02    /* Command is a retry of an aborted command */
 
 /* Sense codes */
 #define SCSI_SENSE_NO_SENSE         0x00
@@ -206,6 +219,13 @@ typedef struct nvme_queue_s {
     ushort_t            vector;         /* Interrupt vector */
     mutex_t             lock;           /* Queue lock */
     nvme_completion_handler_t cpl_handler; /* Completion handler */
+
+    /* Outstanding command tracking */
+    volatile int        outstanding;    /* Atomic counter of commands in flight */
+
+    /* Watchdog timer for missed interrupts */
+    toid_t              watchdog_id;    /* Timeout ID for watchdog timer */
+    volatile int        watchdog_active; /* Flag: 1 if watchdog is running */
 } nvme_queue_t;
 
 
@@ -220,9 +240,27 @@ typedef struct nvme_queue_s {
 #define NVME_CMD_MAX_PRPS 4
 typedef struct nvme_cmd_info {
     scsi_request_t     *req;           /* Associated SCSI request */
+    time_t              start_time;    /* lbolt when command was issued */
     int                 prpidx[NVME_CMD_MAX_PRPS]; /* Index into PRP pool (0-63, -1 if none) */
     int                 last;
 } nvme_cmd_info_t;
+
+/*
+ * Aborted Command Tracking for Retry Detection
+ * Stores key fields from scsi_request_t that remain constant across retries
+ */
+#define NVME_ABORT_FIFO_SIZE 16  /* Track last 16 aborted commands */
+#define NVME_ABORT_TIMEOUT_TICKS (1 * HZ)  /* 1 second - age out stale aborted entries */
+#define SCSI_MAX_CDB_LEN 16      /* Maximum CDB length */
+
+typedef struct nvme_aborted_cmd {
+    u_char              cdb[SCSI_MAX_CDB_LEN]; /* SCSI CDB (command descriptor block) */
+    ushort_t            sr_flags;       /* Direction and control flags */
+    u_char             *sr_buffer;      /* Buffer address */
+    uint_t              sr_buflen;      /* Buffer length */
+    void               *sr_bp;          /* buf_t pointer */
+    time_t              abort_time;     /* lbolt when command was aborted (for aging) */
+} nvme_aborted_cmd_t;
 
 typedef struct nvme_soft_s {
     /* Hardware graph vertices */
@@ -278,7 +316,8 @@ typedef struct nvme_soft_s {
     /* I/O Command tracking - indexed by CID */
     nvme_cmd_info_t     io_requests[NVME_IO_QUEUE_SIZE]; /* wrapped SCSI requests + PRP idx by CID */
     mutex_t             io_requests_lock;    /* Lock for CID allocation */
-    __uint32_t          io_cid_bitmap[8];    /* Bitmap of free CIDs (256 bits = 8x32) */
+    __uint32_t          io_cid_bitmap[NVME_IO_QUEUE_SIZE/32];    /* Bitmap of free CIDs (256 bits = 8x32) */
+    uint_t              io_cid_free_count;   /* Number of free CIDs available */
 
     /* Pre-allocated alenlist for address/length conversions (avoids dynamic allocation failures) */
     alenlist_t          alenlist;            /* Pre-grown alenlist for buf_to_alenlist/kvaddr/uvaddr conversions */
@@ -304,6 +343,16 @@ typedef struct nvme_soft_s {
     /* State */
     int                 initialized;
 
+    /* Timeout watchdog timer */
+    toid_t              timeout_watchdog_id;    /* Timeout ID for timeout checking */
+    volatile int        timeout_watchdog_active; /* Flag: 1 if timeout watchdog is running */
+
+    /* Aborted command tracking for retry detection */
+    nvme_aborted_cmd_t  aborted_cmds[NVME_ABORT_FIFO_SIZE]; /* FIFO of aborted commands */
+    uint_t              aborted_head;   /* Head index (next write position) */
+    uint_t              aborted_bitmap; /* Bitmap of valid entries (bit N = entry N valid) */
+    mutex_t             aborted_lock;   /* Lock for FIFO access */
+
     /* Identification */
     ushort_t            vendor_id;      /* PCI vendor ID */
     ushort_t            device_id;      /* PCI device ID */
@@ -323,42 +372,64 @@ typedef struct nvme_soft_s {
 #define NVME_ADMIN_CID_CREATE_SQ             4
 #define NVME_ADMIN_CID_DELETE_SQ             5
 #define NVME_ADMIN_CID_DELETE_CQ             6
+#define NVME_ADMIN_CID_GET_LOG_PAGE_ERROR    7
 
 /* Special CIDs for ordered I/O commands not associated with scsi_request */
-#define NVME_IO_CID_FLUSH                    0x1000
+#define NVME_IO_CID_FLUSH                    0x8000
+
+/* Special CID encoding for abort commands in admin queue */
+#define NVME_ADMIN_CID_ABORT_MASK            0x8000  /* Bit 15 set = abort command */
+#define NVME_ADMIN_CID_ABORT_CID_MASK        0x7FFF
+#define NVME_ADMIN_CID_MAKE_ABORT(cid)       (NVME_ADMIN_CID_ABORT_MASK | ((cid) & NVME_ADMIN_CID_ABORT_CID_MASK))
+#define NVME_ADMIN_CID_IS_ABORT(cid)         (((cid) & NVME_ADMIN_CID_ABORT_MASK) != 0)
+#define NVME_ADMIN_CID_GET_ABORTED_CID(cid)  ((cid) & NVME_ADMIN_CID_ABORT_CID_MASK)
 
 /*
  * Function Prototypes - nvme_cmd.c
  */
+
+typedef struct nvme_rwcmd_state_s {
+    scsi_request_t *req;
+    alenlist_t alenlist;
+    int need_unlock;
+    __uint64_t lba;
+    uint_t buflen;
+    uint_t num_blocks;
+    uint_t flags;
+    uint_t max_transfer_blocks;
+    uint_t commands;
+    uint_t cidx;
+    unsigned int cids[NVME_IO_QUEUE_SIZE];
+    nvme_command_t cmd;
+} nvme_rwcmd_state_t;
+
+
 int nvme_admin_identify_controller(nvme_soft_t *soft);
 int nvme_admin_identify_namespace(nvme_soft_t *soft);
+int nvme_admin_get_log_page_error(nvme_soft_t *soft);
 int nvme_admin_create_cq(nvme_soft_t *soft, ushort_t qid, ushort_t qsize,
                          alenaddr_t phys_addr, ushort_t vector);
 int nvme_admin_create_sq(nvme_soft_t *soft, ushort_t qid, ushort_t qsize,
                          alenaddr_t phys_addr, ushort_t cqid);
 int nvme_admin_delete_sq(nvme_soft_t *soft, ushort_t qid);
 int nvme_admin_delete_cq(nvme_soft_t *soft, ushort_t qid);
+int nvme_admin_abort_command(nvme_soft_t *soft, ushort_t cid);
 
 int nvme_submit_cmd(nvme_soft_t *soft, nvme_queue_t *q, nvme_command_t *cmd);
 int nvme_wait_for_completion(nvme_queue_t *q, ushort_t cid, uint_t timeout_ms);
 
-int nvme_io_build_rw_command(nvme_soft_t *soft, scsi_request_t *req,
-                              nvme_command_t *cmd, unsigned int cmd_index);
 
 int nvme_get_translated_addr(nvme_soft_t *soft,
                              alenlist_t alenlist,
                              size_t maxlength,
                              alenaddr_t *out_address,
                              size_t *out_length,
-                             int is_write);
+                             int flags);
 
-int nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
-                          alenlist_t *out_alenlist, int *out_need_unlock);
+int nvme_prepare_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps);
 
-int nvme_build_prps_from_alenlist(nvme_soft_t *soft, scsi_request_t *req,
-                                   nvme_command_t *cmd, alenlist_t alenlist,
-                                   unsigned int cmd_index,
-                                   int is_write);
+int nvme_io_build_rw_command(nvme_soft_t *soft, nvme_rwcmd_state_t *ps);
+int nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps);
 
 void nvme_cleanup_alenlist(nvme_soft_t *soft, int need_unlock);
 
@@ -368,7 +439,7 @@ int nvme_prp_pool_alloc(nvme_soft_t *soft);
 void nvme_prp_pool_free(nvme_soft_t *soft, int index);
 
 int nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands, unsigned int *cid_array);
-scsi_request_t *nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid);
+scsi_request_t *nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid, int *last);
 int nvme_io_cid_store_prp(nvme_soft_t *soft, unsigned int cid, int prpidx);
 
 int nvme_cmd_special_flush(nvme_soft_t *soft);
@@ -399,7 +470,11 @@ int nvme_scsi_ioctl(vertex_hdl_t ctlr_vhdl, unsigned int cmd, struct scsi_ha_op 
 void nvme_build_inquiry_data(nvme_soft_t *soft, u_char *inq_data);
 void nvme_init_scsi_target_info(nvme_soft_t *soft);
 
-int nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req, int is_write);
+/* Aborted command FIFO management */
+void nvme_aborted_fifo_add(nvme_soft_t *soft, scsi_request_t *req);
+int nvme_aborted_fifo_find_and_remove(nvme_soft_t *soft, nvme_rwcmd_state_t *ps);
+
+void nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_scsi_inquiry(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_scsi_read_capacity(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_scsi_test_unit_ready(nvme_soft_t *soft, scsi_request_t *req);
@@ -424,6 +499,17 @@ void nvme_start_poll_thread(nvme_soft_t *soft);
 void nvme_stop_poll_thread(nvme_soft_t *soft);
 void nvme_kick_poll_thread(nvme_soft_t *soft);
 void nvme_poll_thread(void *arg);
+
+/* Watchdog timer for missed interrupts */
+void nvme_watchdog_start(nvme_soft_t *soft, nvme_queue_t *q);
+void nvme_watchdog_stop(nvme_queue_t *q);
+void nvme_watchdog_timeout(nvme_soft_t *soft);
+
+/* Timeout checking for stuck commands */
+void nvme_check_timeouts(nvme_soft_t *soft);
+void nvme_timeout_watchdog_start(nvme_soft_t *soft);
+void nvme_timeout_watchdog_stop(nvme_soft_t *soft);
+void nvme_timeout_watchdog_handler(nvme_soft_t *soft);
 
 /*
  * Utility Macros - NVMe BAR MMIO Access

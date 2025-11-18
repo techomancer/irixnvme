@@ -22,8 +22,12 @@
 #include <sys/dkio.h>
 #include <dslib.h>
 
-/* IRIX hardware graph path for controller 2, target 0, lun 0 */
+/* IRIX hardware graph path for controller 2, target 0, lun 0, find some way to find it! */
+#ifdef IP35
+#define DEFAULT_SCSI_PATH "/hw/scsi_ctlr/5/target/0/lun/0/scsi"
+#else
 #define DEFAULT_SCSI_PATH "/hw/scsi_ctlr/2/target/0/lun/0/scsi"
+#endif
 #define BLOCK_SIZE 512
 
 /* Test functions */

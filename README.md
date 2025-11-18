@@ -4,7 +4,7 @@ An NVMe driver for SGI IRIX 6.5, providing SCSI emulation to allow legacy IRIX d
 
 ## Building
 Install all the dev env and mipspro 7.4.4.
-Set CPUBOARD in Makefile to IP30 or IP32
+Set CPUBOARD in Makefile to IP30, IP32 or IP35
 make
 make load
 make ioc
@@ -28,7 +28,7 @@ irixnvme/
 ├── nvme_scsi.c     - SCSI to NVMe translation layer
 ├── nvme_cmd.c      - NVMe command construction and submission
 ├── nvme_cpl.c      - NVMe completion queue handling
-├── Makefile        - IRIX smake build file
+├── Makefile        - IRIX make build file
 └── README.md       - This file
 ```
 
@@ -189,7 +189,7 @@ WRITE: LBA 4523, blocks 128 (65536 bytes), align 4096 bytes
 - SGI system running IRIX 6.5
 - PCI to PCIe bridge
 - NVMe SSD
-- Tested platforms: IP32 (O2), others should work
+- Tested platforms: IP32 (O2), IP30 (Octane), IP35 (Fuel), others could work
 
 ## Inspiration
 
@@ -203,7 +203,8 @@ This driver is equally stupid as the Windows 2000 NVMe driver (`nvme2k`), attemp
 
 ## License
 
-Educational/research purposes. See source files for details.
+BSD 3 clause.
+Use at your risk, don't cry to me if it kills your cat or something.
 
 ## Author
 

@@ -66,9 +66,12 @@ nvme_submit_cmd(nvme_soft_t *soft, nvme_queue_t *q, nvme_command_t *cmd)
     /* Advance tail */
     q->sq_tail = next_tail;
 
+    /* Increment outstanding command counter */
+    atomicAddInt(&q->outstanding, 1);
+
 #ifdef NVME_DBG_EXTRA
-    cmn_err(CE_NOTE, "nvme_submit_cmd: Ringing doorbell at offset 0x%x with value %u",
-            q->sq_doorbell, q->sq_tail);
+    cmn_err(CE_NOTE, "nvme_submit_cmd: Ringing doorbell at offset 0x%x with value %u (outstanding=%d)",
+            q->sq_doorbell, q->sq_tail, q->outstanding);
 #endif
     /* Ring doorbell to notify controller */
     NVME_WR(soft, q->sq_doorbell, q->sq_tail);
@@ -80,6 +83,13 @@ nvme_submit_cmd(nvme_soft_t *soft, nvme_queue_t *q, nvme_command_t *cmd)
             NVME_RD(soft, q->sq_doorbell));
 #endif
     mutex_unlock(&q->lock);
+
+#ifdef NVME_COMPLETION_INTERRUPT
+    /* Start watchdog timer for I/O queue to catch missed interrupts */
+    if (q->qid != 0) {  /* Only for I/O queue, not admin queue */
+        nvme_watchdog_start(soft, q);
+    }
+#endif
 #ifdef NVME_COMPLETION_THREAD
     /* If interrupts are disabled, wake polling thread to check for completions */
     if (!soft->interrupts_enabled) {
@@ -103,7 +113,7 @@ nvme_submit_cmd(nvme_soft_t *soft, nvme_queue_t *q, nvme_command_t *cmd)
                 us_delay(1000); /* 1 millisecond */
         }
 
-        cmn_err(CE_WARN, "nvme_scsi_read_write: after 1ms delay, manually processed %d completions (cq_head %d->%d)  int count=%d",
+        cmn_err(CE_WARN, "nvme_submit_cmd: after 1ms delay, manually processed %d completions (cq_head %d->%d)  int count=%d",
                 num_processed, old_head, q->cq_head, nvme_intcount);
     }
 #endif
@@ -233,6 +243,70 @@ nvme_admin_identify_namespace(nvme_soft_t *soft)
 }
 
 /*
+ * nvme_admin_get_log_page_error: Send Get Log Page command for Error Information
+ *
+ * Uses utility buffer to retrieve error log entries.
+ * The completion handler will decode and dump the first entry.
+ */
+int
+nvme_admin_get_log_page_error(nvme_soft_t *soft)
+{
+    nvme_command_t cmd;
+
+#ifdef NVME_DBG_CMD
+    cmn_err(CE_NOTE, "nvme_admin_get_log_page_error: sending command");
+#endif
+    /* Clear utility buffer */
+    bzero(soft->utility_buffer, NBPP);
+#ifdef IP30
+    heart_dcache_wb_inval((caddr_t)soft->utility_buffer, sizeof(NBPP));
+#else
+    dki_dcache_wbinval((caddr_t)soft->utility_buffer, sizeof(NBPP));
+#endif
+
+    /* Build Get Log Page command */
+    bzero(&cmd, sizeof(cmd));
+
+    /* CDW0: Opcode (7:0), Flags (15:8), CID (31:16) */
+    cmd.cdw0 = NVME_ADMIN_GET_LOG_PAGE | (NVME_ADMIN_CID_GET_LOG_PAGE_ERROR << 16);
+
+    /* NSID: 0xFFFFFFFF for global log pages */
+    cmd.nsid = 0xFFFFFFFF;
+
+    /* PRP1: physical address of utility buffer (log data destination) */
+    cmd.prp1_lo = PHYS64_LO(soft->utility_buffer_phys);
+    cmd.prp1_hi = PHYS64_HI(soft->utility_buffer_phys);
+
+    /* PRP2: not needed (requesting only 4KB) */
+    cmd.prp2_lo = 0;
+    cmd.prp2_hi = 0;
+
+    /* CDW10: Log Page Identifier (7:0) and NUMDL (31:16)
+     * NUMDL = Number of Dwords Lower - 1 (0-based)
+     * For 4KB = 1024 dwords, NUMDL = 1023 = 0x3FF
+     */
+    cmd.cdw10 = NVME_LOG_PAGE_ERROR_INFO | (0x3FF << 16);
+
+    /* CDW11: NUMDU (15:0) = Number of Dwords Upper (upper 16 bits of dword count)
+     * For 4KB, NUMDU = 0
+     */
+    cmd.cdw11 = 0;
+
+    /* Submit command */
+    if (nvme_submit_cmd(soft, &soft->admin_queue, &cmd) != 0) {
+#ifdef NVME_DBG
+        cmn_err(CE_WARN, "nvme_admin_get_log_page_error: failed to submit command (queue full?)");
+#endif
+        return 0;  /* Failure */
+    }
+
+#ifdef NVME_DBG
+    cmn_err(CE_NOTE, "nvme_admin_get_log_page_error: command submitted, waiting for completion");
+#endif
+    return 1;  /* Success - command submitted */
+}
+
+/*
  * nvme_admin_create_cq: Create I/O Completion Queue
  */
 int
@@ -339,6 +413,56 @@ nvme_admin_delete_cq(nvme_soft_t *soft, ushort_t qid)
 }
 
 /*
+ * nvme_admin_abort_command: Abort a command
+ *
+ * Issues an Abort command to the admin queue to abort a specific command.
+ * The CID encoding uses bit 15 set to indicate abort, with the lower 8 bits
+ * containing the CID being aborted.
+ *
+ * Per NVMe spec, CDW10 contains:
+ *   Bits 31:16: Command ID of command to abort
+ *   Bits 15:0:  Submission Queue ID where command was submitted (always 1 for I/O queue)
+ *
+ * Arguments:
+ *   soft - Controller state
+ *   cid  - Command ID to abort (from I/O queue, 0-255)
+ *
+ * Returns:
+ *   1 on success (abort command submitted)
+ *   0 on failure (could not submit)
+ */
+int
+nvme_admin_abort_command(nvme_soft_t *soft, ushort_t cid)
+{
+    nvme_command_t cmd;
+    ushort_t abort_cid;
+
+    bzero(&cmd, sizeof(cmd));
+
+    /* Encode CID for abort: bit 15 set, lower 8 bits = original CID */
+    abort_cid = NVME_ADMIN_CID_MAKE_ABORT(cid);
+
+    /* Build Abort command */
+    cmd.cdw0 = NVME_ADMIN_ABORT;
+    cmd.cdw0 |= abort_cid << 16;
+
+    /* CDW10: SQID (15:0) = 1 (I/O queue), CID (31:16) = command to abort */
+    cmd.cdw10 = 1 | (cid << 16);
+
+#ifdef NVME_DBG
+    cmn_err(CE_NOTE, "nvme_admin_abort_command: aborting CID %d (abort_cid=0x%x)",
+            cid, abort_cid);
+#endif
+
+    if (nvme_submit_cmd(soft, &soft->admin_queue, &cmd) != 0) {
+        cmn_err(CE_WARN, "nvme_admin_abort_command: failed to submit abort for CID %d", cid);
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
  * nvme_io_build_rw_command: Build NVMe Read/Write command from SCSI request
  *
  * Translates SCSI READ/WRITE commands (READ6, READ10, READ16, WRITE6, WRITE10, WRITE16)
@@ -353,9 +477,6 @@ nvme_admin_delete_cq(nvme_soft_t *soft, ushort_t qid)
  *
  * Arguments:
  *   soft      - Controller state
- *   req       - SCSI request structure
- *   cmd       - NVMe command structure to fill in (opcode, nsid, LBA, block count)
- *   cmd_index - Index of this command in multi-command sequence (0-based)
  *
  * Returns:
  *   1 on success
@@ -363,118 +484,29 @@ nvme_admin_delete_cq(nvme_soft_t *soft, ushort_t qid)
  *  -1 on failure (we set sense data)
  */
 int
-nvme_io_build_rw_command(nvme_soft_t *soft, scsi_request_t *req,
-                         nvme_command_t *cmd, unsigned int cmd_index)
+nvme_io_build_rw_command(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 {
-    u_char *cdb = req->sr_command;
-    __uint64_t lba = 0;
-    uint_t num_blocks = 0;
-    int is_write = 0;
-    uint_t cdb_opcode;
+    nvme_command_t *cmd = &(ps->cmd);
+
+    /* Adjust LBA and block count based on command index for multi-command transfers */
+    __uint64_t lba = ps->lba + ps->cidx * ps->max_transfer_blocks;
+    uint_t num_blocks = ps->num_blocks - ps->cidx * ps->max_transfer_blocks;
 
     /* Clear command structure */
     bzero(cmd, sizeof(*cmd));
 
-    /* Parse CDB based on opcode */
-    cdb_opcode = cdb[0];
-
-    switch (cdb_opcode) {
-    case SCSIOP_READ_6:
-    case SCSIOP_WRITE_6:
-        /* READ(6)/WRITE(6) format:
-         * Byte 0: Opcode
-         * Byte 1: LBA bits 20-16 (5 bits) in bits 4-0
-         * Byte 2: LBA bits 15-8
-         * Byte 3: LBA bits 7-0
-         * Byte 4: Transfer length (0 = 256 blocks)
-         * Byte 5: Control
-         */
-        lba = ((__uint64_t)(cdb[1] & 0x1F) << 16) |
-              ((__uint64_t)cdb[2] << 8) |
-              ((__uint64_t)cdb[3]);
-        num_blocks = cdb[4];
-        if (num_blocks == 0) {
-            num_blocks = 256;  /* 0 means 256 blocks in READ(6)/WRITE(6) */
-        }
-        is_write = (cdb_opcode == SCSIOP_WRITE_6);
-        break;
-
-    case SCSIOP_READ_10:
-    case SCSIOP_WRITE_10:
-        /* READ(10)/WRITE(10) format:
-         * Byte 0: Opcode
-         * Byte 1: Flags
-         * Byte 2: LBA bits 31-24
-         * Byte 3: LBA bits 23-16
-         * Byte 4: LBA bits 15-8
-         * Byte 5: LBA bits 7-0
-         * Byte 6: Reserved
-         * Byte 7: Transfer length bits 15-8
-         * Byte 8: Transfer length bits 7-0
-         * Byte 9: Control
-         */
-        lba = ((__uint64_t)cdb[2] << 24) |
-              ((__uint64_t)cdb[3] << 16) |
-              ((__uint64_t)cdb[4] << 8) |
-              ((__uint64_t)cdb[5]);
-        num_blocks = ((uint_t)cdb[7] << 8) | ((uint_t)cdb[8]);
-        is_write = (cdb_opcode == SCSIOP_WRITE_10);
-        break;
-
-    case SCSIOP_READ_16:
-    case SCSIOP_WRITE_16:
-        /* READ(16)/WRITE(16) format:
-         * Byte 0: Opcode
-         * Byte 1: Flags
-         * Byte 2: LBA bits 63-56
-         * Byte 3: LBA bits 55-48
-         * Byte 4: LBA bits 47-40
-         * Byte 5: LBA bits 39-32
-         * Byte 6: LBA bits 31-24
-         * Byte 7: LBA bits 23-16
-         * Byte 8: LBA bits 15-8
-         * Byte 9: LBA bits 7-0
-         * Byte 10: Transfer length bits 31-24
-         * Byte 11: Transfer length bits 23-16
-         * Byte 12: Transfer length bits 15-8
-         * Byte 13: Transfer length bits 7-0
-         * Byte 14: Flags
-         * Byte 15: Control
-         */
-        lba = ((__uint64_t)cdb[2] << 56) |
-              ((__uint64_t)cdb[3] << 48) |
-              ((__uint64_t)cdb[4] << 40) |
-              ((__uint64_t)cdb[5] << 32) |
-              ((__uint64_t)cdb[6] << 24) |
-              ((__uint64_t)cdb[7] << 16) |
-              ((__uint64_t)cdb[8] << 8) |
-              ((__uint64_t)cdb[9]);
-        num_blocks = ((uint_t)cdb[10] << 24) |
-                     ((uint_t)cdb[11] << 16) |
-                     ((uint_t)cdb[12] << 8) |
-                     ((uint_t)cdb[13]);
-        is_write = (cdb_opcode == SCSIOP_WRITE_16);
-        break;
-
-    default:
-        cmn_err(CE_WARN, "nvme_io_build_rw_command: unsupported CDB opcode 0x%02x",
-                cdb_opcode);
-        return 0;
-    }
-
-    /* Adjust LBA and block count based on command index for multi-command transfers */
-    lba += cmd_index * soft->max_transfer_blocks;
-    num_blocks -= cmd_index * soft->max_transfer_blocks;
-    if (num_blocks > soft->max_transfer_blocks) {
-        num_blocks = soft->max_transfer_blocks;
+    if (num_blocks > ps->max_transfer_blocks) {
+        num_blocks = ps->max_transfer_blocks;
     }
 
     /* Build NVMe command header - CID will be set by caller */
-    if (is_write) {
+    if (ps->flags & NF_WRITE) {
         cmd->cdw0 = NVME_CMD_WRITE;
     } else {
         cmd->cdw0 = NVME_CMD_READ;
     }
+
+    cmd->cdw0 |= (ps->cids[ps->cidx] << 16);
 
     /* Set namespace ID (hardcoded to 1) */
     cmd->nsid = 1;
@@ -489,8 +521,8 @@ nvme_io_build_rw_command(nvme_soft_t *soft, scsi_request_t *req,
     /* Remaining fields already zeroed by bzero() above */
 
 #ifdef NVME_DBG_CMD
-    cmn_err(CE_NOTE, "nvme_io_build_rw_command: %s cmd_index=%u LBA=%llu blocks=%u",
-            is_write ? "WRITE" : "READ", cmd_index, lba, num_blocks);
+    cmn_err(CE_NOTE, "nvme_io_build_rw_command: %s cidx=%u LBA=%llu blocks=%u",
+            (ps->flags & NF_WRITE) ? "WRITE" : "READ", ps->cidx, lba, num_blocks);
 #endif
     return 1;
 }
@@ -507,7 +539,7 @@ nvme_io_build_rw_command(nvme_soft_t *soft, scsi_request_t *req,
  *   maxlength    - Maximum bytes to fetch (typically nvme_page_size)
  *   out_address  - Output: Translated PCI bus address (physical address)
  *   out_length   - Output: Length of this segment in bytes
- *   is_write     - whether the operatio is read or write
+ *   flags        - whether the operatio is read or write
  *
  * Returns:
  *   0 on success
@@ -515,7 +547,7 @@ nvme_io_build_rw_command(nvme_soft_t *soft, scsi_request_t *req,
  */
 int
 nvme_get_translated_addr(nvme_soft_t *soft, alenlist_t alenlist, size_t maxlength,
-                        alenaddr_t *out_address, size_t *out_length, int is_write)
+                        alenaddr_t *out_address, size_t *out_length, int flags)
 {
     alenaddr_t address;
     size_t length;
@@ -528,16 +560,11 @@ nvme_get_translated_addr(nvme_soft_t *soft, alenlist_t alenlist, size_t maxlengt
     /* Translate to PCI bus address with explicit cast to quiet warnings */
     address = pciio_dmatrans_addr(soft->pci_vhdl, NULL, (paddr_t)address, length,
                                   PCIIO_DMA_DATA | DMATRANS64 | PCIIO_BYTE_STREAM
-#ifdef NVME_VCHAN1
-                                  | PCIBR_VCHAN1
-#endif
-#ifdef NVME_READ_BARRIER
-                                  | (is_write ? 0 : PCIBR_BARRIER)
-#endif
-#ifdef IP30
-                                  | (is_write ? 0 : PCIIO_NOPREFETCH)
+#if defined(IP30) || defined(IP35)
+                                  | ((flags & NF_WRITE) ? PCIIO_NOPREFETCH : PCIBR_BARRIER)
 #endif
                                 );
+
     if (!address) {
         return -1;
     }
@@ -560,25 +587,21 @@ nvme_get_translated_addr(nvme_soft_t *soft, alenlist_t alenlist, size_t maxlengt
  *
  * Arguments:
  *   soft            - Controller state
- *   req             - SCSI request to convert
- *   out_alenlist    - Output: alenlist to use for PRP building
- *   out_need_unlock - Output: 1 if caller must unlock soft->alenlist_lock when done
+ *   ps              - rw command builder state
  *
  * Returns:
- *   0 on success
- *   -1 on failure (logs error via cmn_err)
+ *   1 on success
+ *   0 or -1 on failure (logs error via cmn_err)
  */
 int
-nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
-                      alenlist_t *out_alenlist, int *out_need_unlock)
+nvme_prepare_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 {
-    alenlist_t alenlist = NULL;
-    int need_unlock = 0;
+    scsi_request_t *req = ps->req;
+    ps->alenlist = NULL;
+    ps->need_unlock = 0;
 
-    /* If no data transfer, nothing to prepare */
-    if (req->sr_buflen == 0 || req->sr_buffer == NULL) {
-        *out_alenlist = NULL;
-        *out_need_unlock = 0;
+    if (req->sr_buffer == NULL && !(req->sr_flags & (SRF_ALENLIST | SRF_MAPBP))) {
+        cmn_err(CE_WARN, "nvme_prepare_alenlist: NULL buffer with flags:0x%x buflen:%u buffer:%p", req->sr_flags, req->sr_buflen, req->sr_buffer);
         return 0;
     }
 
@@ -592,18 +615,14 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
          * and stored in the buffer's b_private field. Use it directly.
          */
         if (!IS_KUSEG(req->sr_buffer)) {
-#ifdef NVME_DBG
             cmn_err(CE_WARN, "nvme_prepare_alenlist: SRF_ALENLIST but address not KUSEG");
-#endif
-            return -1;
+            return 0;
         }
 
-        alenlist = (alenlist_t)(((buf_t *)(req->sr_bp))->b_private);
-        if (!alenlist) {
-#ifdef NVME_DBG
+        ps->alenlist = (alenlist_t)(((buf_t *)(req->sr_bp))->b_private);
+        if (!ps->alenlist) {
             cmn_err(CE_WARN, "nvme_prepare_alenlist: SRF_ALENLIST but no alenlist in bp->b_private");
-#endif
-            return -1;
+            return 0;
         }
 
 #ifdef NVME_DBG
@@ -616,19 +635,17 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
          * Lock it to prevent concurrent use, following ql.c pattern
          */
         mutex_lock(&soft->alenlist_lock, PZERO);
-        need_unlock = 1;
-        alenlist = soft->alenlist;
+        ps->need_unlock = 1;
+        ps->alenlist = soft->alenlist;
 
         if (req->sr_flags & SRF_MAPBP) {
             /*
              * Buffer-based mapping case - convert buf_t to alenlist
              */
             if (BP_ISMAPPED(((buf_t *)(req->sr_bp)))) {
-#ifdef NVME_DBG
                 cmn_err(CE_WARN, "nvme_prepare_alenlist: SRF_MAPBP but buffer is already mapped");
-#endif
                 mutex_unlock(&soft->alenlist_lock);
-                return -1;
+                return 0;
             }
 
             /*
@@ -648,12 +665,10 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
             }
 
             /* Convert buf_t to alenlist (buf_to_alenlist clears the alenlist first) */
-            if (buf_to_alenlist(alenlist, (buf_t *)(req->sr_bp), AL_NOCOMPACT) == NULL) {
-#ifdef NVME_DBG
+            if (buf_to_alenlist(ps->alenlist, (buf_t *)(req->sr_bp), AL_NOCOMPACT) == NULL) {
                 cmn_err(CE_WARN, "nvme_prepare_alenlist: buf_to_alenlist failed");
-#endif
                 mutex_unlock(&soft->alenlist_lock);
-                return -1;
+                return 0;
             }
 
 #ifdef NVME_DBG
@@ -675,6 +690,8 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
                         (__psunsigned_t)req->sr_buffer);
 #endif
                 mutex_unlock(&soft->alenlist_lock);
+                nvme_set_adapter_status(req, SC_ALIGN, ST_GOOD);
+                
                 return -1;
             }
             if ((req->sr_buflen & 0x3) != 0) {
@@ -683,6 +700,7 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
                         req->sr_buflen);
 #endif
                 mutex_unlock(&soft->alenlist_lock);
+                nvme_set_adapter_status(req, SC_ALIGN, ST_GOOD);
                 return -1;
             }
 
@@ -705,26 +723,22 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
             /* Convert to alenlist based on address type */
             if (is_user_addr) {
                 /* User virtual address - use uvaddr_to_alenlist with pre-allocated alenlist */
-                if (uvaddr_to_alenlist(alenlist, (uvaddr_t)req->sr_buffer,
-                                      req->sr_buflen, 0) == NULL) {
-#ifdef NVME_DBG
+                if (uvaddr_to_alenlist(ps->alenlist, (uvaddr_t)req->sr_buffer,
+                                       req->sr_buflen, 0) == NULL) {
                     cmn_err(CE_WARN, "nvme_prepare_alenlist: uvaddr_to_alenlist failed");
-#endif
                     mutex_unlock(&soft->alenlist_lock);
-                    return -1;
+                    return 0;
                 }
 #ifdef NVME_DBG
                 cmn_err(CE_NOTE, "nvme_prepare_alenlist: converted uvaddr to alenlist (KUSEG)");
 #endif
             } else {
                 /* Kernel virtual address - use kvaddr_to_alenlist with pre-allocated alenlist */
-                if (kvaddr_to_alenlist(alenlist, (caddr_t)req->sr_buffer,
-                                      req->sr_buflen, AL_NOCOMPACT) == NULL) {
-#ifdef NVME_DBG
+                if (kvaddr_to_alenlist(ps->alenlist, (caddr_t)req->sr_buffer,
+                                       req->sr_buflen, AL_NOCOMPACT) == NULL) {
                     cmn_err(CE_WARN, "nvme_prepare_alenlist: kvaddr_to_alenlist failed");
-#endif
                     mutex_unlock(&soft->alenlist_lock);
-                    return -1;
+                    return 0;
                 }
 #ifdef NVME_DBG
                 cmn_err(CE_NOTE, "nvme_prepare_alenlist: converted kvaddr to alenlist (!KUSEG)");
@@ -735,24 +749,19 @@ nvme_prepare_alenlist(nvme_soft_t *soft, scsi_request_t *req,
              * Unknown or unsupported buffer mode
              * One of SRF_ALENLIST, SRF_MAPBP, SRF_MAP, or SRF_MAPUSER must be set
              */
-#ifdef NVME_DBG
             cmn_err(CE_WARN, "nvme_prepare_alenlist: no valid buffer mapping flag set (sr_flags=0x%x)",
                     req->sr_flags);
-#endif
             mutex_unlock(&soft->alenlist_lock);
-            return -1;
+            return 0;
         }
     }
 
-    *out_alenlist = alenlist;
-    *out_need_unlock = need_unlock;
-
     /* Initialize alenlist cursor at offset 0 (cursor will track offset as we walk) */
-    if (alenlist != NULL) {
-        alenlist_cursor_init(alenlist, 0, NULL);
+    if (ps->alenlist != NULL) {
+        alenlist_cursor_init(ps->alenlist, 0, NULL);
     }
 
-    return 0;
+    return 1;
 }
 
 /*
@@ -786,11 +795,7 @@ nvme_cleanup_alenlist(nvme_soft_t *soft, int need_unlock)
  *
  * Arguments:
  *   soft      - Controller state
- *   req       - SCSI request (for buflen and setting status on error)
- *   cmd       - NVMe command to fill in PRP fields (must have cdw12 set)
- *   alenlist  - Prepared alenlist to walk (cursor maintains offset)
- *   cmd_index - Command index in multi-command sequence
- *   is_write
+ *   ps        - rw command builder state
  *
  * Returns:
  *   1 on success
@@ -798,45 +803,40 @@ nvme_cleanup_alenlist(nvme_soft_t *soft, int need_unlock)
  *  -1 on resource exhaustion (BUSY status set internally, caller should retry)
  */
 int
-nvme_build_prps_from_alenlist(nvme_soft_t *soft, scsi_request_t *req,
-                               nvme_command_t *cmd, alenlist_t alenlist,
-                               unsigned int cmd_index,
-                               int is_write)
+nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 {
+    scsi_request_t *req = ps->req;
+    nvme_command_t *cmd = &(ps->cmd);
     alenaddr_t address;
     size_t length;
     size_t fetch_size;
     uint_t chunk_size;
-    unsigned int cid = (cmd->cdw0 >> 16) & 0xFFFF;
-
-    /* Clear PRP fields in command */
-    cmd->prp1_lo = 0;
-    cmd->prp1_hi = 0;
-    cmd->prp2_lo = 0;
-    cmd->prp2_hi = 0;
 
     /* If no data transfer, we're done */
-    if (alenlist == NULL || req->sr_buflen == 0) {
-        return 1;  /* Success - no PRPs needed */
+    if (!ps->alenlist) {
+        cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: NULL alenlist sr_flags:0x%x cidx:%u buflen:%u savedbl:%u", req->sr_flags, ps->cidx, req->sr_buflen, ps->alenlist, ps->buflen);
+        return 0;  /* Success - no PRPs needed */
+    }
+    if (!req->sr_buflen) {
+        cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: 0 length sr_flags:0x%x cidx:%u alenlist:%p savedbl:%u", req->sr_flags, ps->cidx, ps->alenlist, ps->buflen);
+        return 0;  /* Success - no PRPs needed */
     }
 
     /* Calculate chunk size for this command */
-    chunk_size = req->sr_buflen - (cmd_index * soft->max_transfer_blocks * soft->block_size);
-    if (chunk_size > soft->max_transfer_blocks * soft->block_size) {
-        chunk_size = soft->max_transfer_blocks * soft->block_size;
+    chunk_size = req->sr_buflen - (ps->cidx * ps->max_transfer_blocks * soft->block_size);
+    if (chunk_size > ps->max_transfer_blocks * soft->block_size) {
+        chunk_size = ps->max_transfer_blocks * soft->block_size;
     }
 
 #ifdef NVME_DBG_CMD
-    cmn_err(CE_NOTE, "nvme_build_prps_from_alenlist: cmd_index=%u chunk_size=%u buflen=%u",
-            cmd_index, chunk_size, req->sr_buflen);
+    cmn_err(CE_NOTE, "nvme_build_prps_from_alenlist: cidx=%u chunk_size=%u buflen=%u",
+            ps->cidx, chunk_size, req->sr_buflen);
 #endif
 
     /* Get and translate the first page (possibly partial) for PRP1 */
     fetch_size = (chunk_size < soft->nvme_page_size) ? chunk_size : soft->nvme_page_size;
-    if (nvme_get_translated_addr(soft, alenlist, fetch_size, &address, &length, is_write) != 0) {
-#ifdef NVME_DBG
+    if (nvme_get_translated_addr(soft, ps->alenlist, fetch_size, &address, &length, ps->flags) != 0) {
         cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to get/translate first page");
-#endif
         return 0;  /* Hard error - DMA translation failed */
     }
 
@@ -856,9 +856,6 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, scsi_request_t *req,
         /*
          * CASE 1: Single page transfer - PRP1 only
          */
-        cmd->prp2_lo = 0;
-        cmd->prp2_hi = 0;
-
 #ifdef NVME_DBG
         cmn_err(CE_NOTE, "nvme_build_prps_from_alenlist: single page (PRP1 only)");
 #endif
@@ -867,10 +864,8 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, scsi_request_t *req,
          * CASE 2: Exactly 2 pages - use PRP2 directly (no PRP list needed)
          */
         fetch_size = chunk_size;
-        if (nvme_get_translated_addr(soft, alenlist, fetch_size, &address, &length, is_write) != 0) {
-#ifdef NVME_DBG
+        if (nvme_get_translated_addr(soft, ps->alenlist, fetch_size, &address, &length, ps->flags) != 0) {
             cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to get/translate second page");
-#endif
             return 0;  /* Hard error - DMA translation failed */
         }
 
@@ -895,11 +890,9 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, scsi_request_t *req,
         while (chunk_size > 0) {
             /* Get and translate next chunk */
             fetch_size = (chunk_size < soft->nvme_page_size) ? chunk_size : soft->nvme_page_size;
-            if (nvme_get_translated_addr(soft, alenlist, fetch_size, &address, &length, is_write) != 0) {
-#ifdef NVME_DBG
+            if (nvme_get_translated_addr(soft, ps->alenlist, fetch_size, &address, &length, ps->flags) != 0) {
                 cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to get/translate page (remaining=%u)",
                         chunk_size);
-#endif
                 return 0;  /* Hard error - DMA translation failed */
             }
 
@@ -921,11 +914,9 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, scsi_request_t *req,
                 }
 
                 /* Store PRP page with CID */
-                if (nvme_io_cid_store_prp(soft, cid, pool_index) != 0) {
-#ifdef NVME_DBG
+                if (nvme_io_cid_store_prp(soft, ps->cids[ps->cidx], pool_index) != 0) {
                     cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to store PRP index %d with CID %u",
-                            pool_index, cid);
-#endif
+                            pool_index, ps->cids[ps->cidx]);
                     nvme_prp_pool_free(soft, pool_index);
                     return 0;
                 }
@@ -1143,14 +1134,14 @@ nvme_prp_pool_free(nvme_soft_t *soft, int index)
  *   soft      - Controller state
  *   req       - SCSI request structure
  *   commands  - Number of CIDs to allocate
- *   cid_array - Output array to store allocated CIDs (must have space for 'commands' entries)
+ *   cids - Output array to store allocated CIDs (must have space for 'commands' entries)
  *
  * Returns:
  *   0 on success (all CIDs allocated)
  *   -1 on failure (not enough free CIDs available, none allocated)
  */
 int
-nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands, unsigned int *cid_array)
+nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands, unsigned int *cids)
 {
     unsigned int allocated = 0;
     unsigned int word_idx;
@@ -1166,8 +1157,18 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
 
     mutex_lock(&soft->io_requests_lock, PZERO);
 
-    /* Search for free bits in the bitmap (8 words x 32 bits = 256 bits) */
-    for (word_idx = 0; word_idx < 8 && allocated < commands; word_idx++) {
+    /* Early rejection: check if we have enough free CIDs */
+    if (soft->io_cid_free_count < commands) {
+        mutex_unlock(&soft->io_requests_lock);
+#ifdef NVME_DBG
+        cmn_err(CE_WARN, "nvme_io_cid_alloc: insufficient free CIDs (requested %u, available %u)",
+                commands, soft->io_cid_free_count);
+#endif
+        return -1;
+    }
+
+    /* Search for free bits in the bitmap */
+    for (word_idx = 0; word_idx < (NVME_IO_QUEUE_SIZE/32) && allocated < commands; word_idx++) {
         word = soft->io_cid_bitmap[word_idx];
 
         /* If word is all ones, no free slots in this word */
@@ -1185,7 +1186,7 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
                 soft->io_cid_bitmap[word_idx] |= mask;
 
                 /* Store CID in output array */
-                cid_array[allocated] = cid;
+                cids[allocated] = cid;
                 allocated++;
 
                 /* Update the word variable for next iteration */
@@ -1198,7 +1199,7 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
     if (allocated < commands) {
         /* Not enough free CIDs - rollback all allocations */
         for (i = 0; i < allocated; i++) {
-            cid = cid_array[i];
+            cid = cids[i];
             word_idx = cid >> 5u;
             bit_idx = cid & 0x1F;
             mask = 1u << bit_idx;
@@ -1212,19 +1213,23 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
         return -1;
     }
 
+    /* Decrement free count now that allocation succeeded */
+    soft->io_cid_free_count -= commands;
+
     mutex_unlock(&soft->io_requests_lock);
 
     /* Initialize all allocated CID slots (outside lock since we own them) */
     for (i = 0; i < commands; i++) {
-        cid = cid_array[i];
+        cid = cids[i];
         soft->io_requests[cid].req = req;
+        soft->io_requests[cid].start_time = lbolt;  /* Record start time for timeout tracking */
         for (word_idx = 0; word_idx < NVME_CMD_MAX_PRPS; word_idx++) {
             soft->io_requests[cid].prpidx[word_idx] = -1;
         }
     }
 
-    /* Store reference count in sr_ha (cast to void pointer) */
-    req->sr_ha = (void *)(__psint_t)commands;
+    /* Atomically add the number of commands to sr_ha refcount */
+    atomicAddInt((int *)&req->sr_ha, commands);
 
     return 0;
 }
@@ -1243,7 +1248,7 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
  *   NULL if there are still outstanding CIDs for this request
  */
 scsi_request_t *
-nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid)
+nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid, int *last)
 {
     scsi_request_t *req;
     unsigned int word_idx;
@@ -1265,9 +1270,6 @@ nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid)
 
     req = soft->io_requests[cid].req;
 
-    /* Clear the scsi_request pointer */
-    soft->io_requests[cid].req = NULL;
-
     /* Free PRP storage */
     for (i = 0; i < NVME_CMD_MAX_PRPS; i++) {
         if (soft->io_requests[cid].prpidx[i] >= 0) {
@@ -1277,32 +1279,29 @@ nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid)
     }
 
     mutex_lock(&soft->io_requests_lock, PZERO);
+    /* Clear the scsi_request pointer (must be inside lock to avoid races with timeout check) */
+    soft->io_requests[cid].req = NULL;
     /* Clear the bit to mark as free */
     soft->io_cid_bitmap[word_idx] &= ~mask;
+    /* Increment free count */
+    soft->io_cid_free_count++;
     mutex_unlock(&soft->io_requests_lock);
 
-    /* Decrement reference count and check if this was the last one */
+    /* Atomically decrement reference count and check if this was the last one */
     if (req != NULL) {
-        /* Get current refcount from sr_ha */
-        refcount = (__psint_t)req->sr_ha;
-
-        /* Decrement (single-threaded completion, no need for atomics) */
-        refcount--;
-        req->sr_ha = (void *)(__psint_t)refcount;
+        /* Atomically decrement refcount and get the NEW value */
+        refcount = atomicAddInt((int *)&req->sr_ha, -1);
 
 #ifdef NVME_DBG_EXTRA
         cmn_err(CE_NOTE, "nvme_io_cid_done: CID %u done, refcount now %u", cid, refcount);
 #endif
 
-        /* Only return req if all commands are done */
-        if (refcount == 0) {
-            /* Clear sr_ha before returning (required before sr_notify) */
-            req->sr_ha = NULL;
-            return req;
-        }
+        /* Only return req if all commands are done (refcount reached 0) */
+        if (last)
+            *last = (refcount == 0);
     }
 
-    return NULL;
+    return req;
 }
 
 /*

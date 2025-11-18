@@ -94,6 +94,22 @@
 #define NVME_LOG_PAGE_FW_SLOT_INFO      0x03
 
 /*
+ * NVMe Error Information Log Entry (64 bytes)
+ * Per NVMe 1.0e specification, Figure 73
+ */
+typedef struct _nvme_error_log_entry {
+    __uint32_t error_count_lo;      /* Offset 0: Error Count low (63:32 in high) */
+    __uint32_t error_count_hi;      /* Offset 4: Error Count high */
+    __uint32_t sqid_cid;            /* Offset 8: SQID (15:0), CID (31:16) */
+    __uint32_t status_pstat_loc;    /* Offset 12: Status (15:0), Param Error Loc (23:16), reserved (31:24) */
+    __uint32_t lba_lo;              /* Offset 16: LBA low 32 bits */
+    __uint32_t lba_hi;              /* Offset 20: LBA high 32 bits */
+    __uint32_t nsid;                /* Offset 24: Namespace ID */
+    uchar_t vendor_specific;        /* Offset 28: Vendor Specific Info Avail */
+    uchar_t reserved[35];           /* Offset 29-63: Reserved */
+} nvme_error_log_entry_t;
+
+/*
  * NVMe Status Codes (Status Code field, bits 7:1 of Status Word DW3[15:0])
  * Per NVMe 1.0e specification, Figure 38
  */

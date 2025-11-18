@@ -15,17 +15,25 @@ CPUBOARD=IP30
 # This provides $(CC), $(LD), $(CFLAGS), $(LDFLAGS), $(ML), etc.
 include /var/sysgen/Makefile.kernloadio
 
+COMMON_FLAGS=
+COMMON_LDFLAGS=-v
+COMMON_CFLAGS=
+LDFLAGS_IP35=-nostdlib -64 -mips4
 LDFLAGS_IP30=-nostdlib -64 -mips4
 LDFLAGS_IP32=-nostdlib -n32 -mips3
+MYCFLAGS_IP35=-mips4 -DPTE_64BIT
 MYCFLAGS_IP30=-mips4 -DPTE_64BIT -DHEART_INVALIDATE_WAR
 MYCFLAGS_IP32=-mips3
 
 #if $(CPUBOARD) == "IP30"
-MYCFLAGS=$(MYCFLAGS_IP30)
-LDFLAGS=$(LDFLAGS_IP30)
+MYCFLAGS=$(MYCFLAGS_IP30) $(COMMON_FLAGS) $(COMMON_CFLAGS)
+LDFLAGS=$(LDFLAGS_IP30) $(COMMON_FLAGS) $(COMMON_LDFLAGS)
 #elif $(CPUBOARD) == "IP32"
-MYCFLAGS=$(MYCFLAGS_IP32)
-LDFLAGS=$(LDFLAGS_IP32)
+MYCFLAGS=$(MYCFLAGS_IP32) $(COMMON_FLAGS) $(COMMON_CFLAGS)
+LDFLAGS=$(LDFLAGS_IP32) $(COMMON_FLAGS) $(COMMON_LDFLAGS)
+#elif $(CPUBOARD) == "IP35"
+MYCFLAGS=$(MYCFLAGS_IP35) $(COMMON_FLAGS) $(COMMON_CFLAGS)
+LDFLAGS=$(LDFLAGS_IP35) $(COMMON_FLAGS) $(COMMON_LDFLAGS)
 #else
 #endif
 # Define module loader tool
@@ -103,6 +111,10 @@ ioc:
 nt:
 	cc nvmetest.c -o nt
 
+dp:
+	diskperf -D -W -c100m -r4k -m4m /nvme/lol
+
+
 # Help target
 help:
 	@echo "IRIX NVMe Driver Makefile"
@@ -133,4 +145,4 @@ help:
 	@echo "  ml unld -p nvme_        # Unload by prefix"
 	@echo "  ml list                 # List modules"
 
-.PHONY: all load unload reload list clean install help reboot ioc nt
+.PHONY: all load unload reload list clean install help reboot ioc nt dp

@@ -781,33 +781,15 @@ nvme_initialize(nvme_soft_t *soft)
      * Cache line size of 128 bytes (0x80) matches SGI system cache line size.
      * This is important for proper DMA performance.
      */
-    pciio_config_set(soft->pci_vhdl, PCI_CFG_LATENCY_TIMER, sizeof(uint8_t), (uint64_t)0x40);
+    pciio_config_set(soft->pci_vhdl, PCI_CFG_LATENCY_TIMER, sizeof(uint8_t), (uint64_t)0xF0);
     pciio_config_set(soft->pci_vhdl, PCI_CFG_CACHE_LINE, sizeof(uint8_t), (uint64_t)0x80);
-    /* this turbo button is fake */
-    pciio_priority_set(soft->pci_vhdl, PCI_PRIO_HIGH);
-    pciio_priority_set(soft->pcie_bridge_vhdl, PCI_PRIO_HIGH);
 #ifdef IP30
-    if (pcibr_device_flags_set(soft->pci_vhdl, PCIBR_64BIT != 1)) {
+#if 0
+    // that causes ultra bad juju
+    if (pcibr_device_flags_set(soft->pci_vhdl, PCIBR_64BIT) != 1) {
         cmn_err(CE_WARN, "nvme: cannot set 64bit");
     }
-    {
-#ifdef NVME_VCHAN1
-        int vchan0 = 1, vchan1 = 3;
-#else        
-        int vchan0 = 3, vchan1 = 0;
 #endif
-        if (pcibr_rrb_alloc(soft->pci_vhdl, &vchan0, &vchan1) != 0) {
-#ifdef NVME_VCHAN1
-            vchan1--;
-#else
-            vchan0--;
-#endif            
-            if (pcibr_rrb_alloc(soft->pci_vhdl, &vchan0, &vchan1) != 0) {
-                cmn_err(CE_WARN, "nvme: cannot allocate at least %d RRBs", vchan0);
-                return -1;
-            }
-        }
-    }
     {
         vertex_hdl_t xconn_vhdl; // The xtalk connect point for the bridge
         bridge_t *bridge;
@@ -826,18 +808,19 @@ nvme_initialize(nvme_soft_t *soft)
                                 sizeof(name));
         cmn_err(CE_WARN, "PCI parent vertex is %s", name);
 
-        hwgraph_vertex_name_get(soft->pcie_bridge_vhdl,
-                                name,
-                                sizeof(name));
-        cmn_err(CE_WARN, "PCI bridge vertex is %s", name);
+        if (soft->pcie_bridge_vhdl) {
+            hwgraph_vertex_name_get(soft->pcie_bridge_vhdl,
+                                    name,
+                                    sizeof(name));
+            cmn_err(CE_WARN, "PCI bridge vertex is %s", name);
 
-        xconn_vhdl = device_master_get(soft->pcie_bridge_vhdl);
+            xconn_vhdl = device_master_get(soft->pcie_bridge_vhdl);
 
-        hwgraph_vertex_name_get(xconn_vhdl,
-                                name,
-                                sizeof(name));
-        cmn_err(CE_WARN, "PCI bridge parent vertex is %s", name);
-
+            hwgraph_vertex_name_get(xconn_vhdl,
+                                    name,
+                                    sizeof(name));
+            cmn_err(CE_WARN, "PCI bridge parent vertex is %s", name);
+        }
 
 #if 0        
         bridge = (bridge_t *)
@@ -954,6 +937,9 @@ nvme_initialize(nvme_soft_t *soft)
     soft->admin_queue.sq_doorbell = 0x1000 + (2 * 0 * soft->doorbell_stride);  /* = 0x1000 */
     soft->admin_queue.cq_doorbell = 0x1000 + ((2 * 0 + 1) * soft->doorbell_stride);
     soft->admin_queue.cpl_handler = nvme_handle_admin_completion;
+    soft->admin_queue.outstanding = 0;
+    soft->admin_queue.watchdog_id = 0;
+    soft->admin_queue.watchdog_active = 0;
 
     init_mutex(&soft->admin_queue.lock, MUTEX_DEFAULT, "nvme_admin", 0);
 
@@ -1017,6 +1003,9 @@ nvme_initialize(nvme_soft_t *soft)
     soft->io_queue.cq_doorbell = 0x1000 + ((2 * 1 + 1) * soft->doorbell_stride);
     soft->io_queue.vector = 0;
     soft->io_queue.cpl_handler = nvme_handle_io_completion;
+    soft->io_queue.outstanding = 0;
+    soft->io_queue.watchdog_id = 0;
+    soft->io_queue.watchdog_active = 0;
 
     init_mutex(&soft->io_queue.lock, MUTEX_DEFAULT, "nvme_io", 0);
 
@@ -1024,6 +1013,7 @@ nvme_initialize(nvme_soft_t *soft)
      * Initialize I/O command tracking
      * (io_requests and io_cid_bitmap already zeroed by kmem_zalloc)
      */
+    soft->io_cid_free_count = NVME_IO_QUEUE_SIZE;
     init_mutex(&soft->io_requests_lock, MUTEX_DEFAULT, "nvme_io_cid", 0);
 
     /*
@@ -1058,6 +1048,17 @@ nvme_initialize(nvme_soft_t *soft)
     init_mutex(&soft->alenlist_lock, MUTEX_DEFAULT, "nvme_alenlist", 0);
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme: pre-allocated alenlist for %d pages", v.v_maxdmasz);
+#endif
+
+    /*
+     * Initialize aborted command FIFO for retry detection
+     * (aborted_cmds array already zeroed by kmem_zalloc)
+     */
+    soft->aborted_head = 0;
+    soft->aborted_bitmap = 0;
+    init_mutex(&soft->aborted_lock, MUTEX_DEFAULT, "nvme_aborted", 0);
+#ifdef NVME_DBG
+    cmn_err(CE_NOTE, "nvme: initialized aborted command FIFO");
 #endif
     /*
      * Allocate utility buffer (1 page for admin commands during init)
@@ -1209,6 +1210,10 @@ nvme_initialize(nvme_soft_t *soft)
         us_delay(1000);
     }
 #endif
+
+    /* Start timeout watchdog for checking hung commands */
+    nvme_timeout_watchdog_start(soft);
+
     soft->initialized = 1;
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "!nvme_attach: set soft=%p initialized=1", soft);
@@ -1277,6 +1282,14 @@ nvme_shutdown(nvme_soft_t *soft)
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme: shutting down controller");
 #endif
+
+    /* Stop timeout watchdog */
+    nvme_timeout_watchdog_stop(soft);
+
+    /* Stop completion watchdog timer before freeing I/O queue */
+    nvme_watchdog_stop(&soft->io_queue);
+    nvme_watchdog_stop(&soft->admin_queue);
+
     /*
      * Disable interrupts before shutting down
      * 1. Mask all NVMe interrupts (write to INTMS)
@@ -1338,6 +1351,7 @@ nvme_shutdown(nvme_soft_t *soft)
 #ifdef NVME_UTILBUF_USEDMAP
     pciio_dmamap_free(soft->utility_buffer_dmamap);
 #endif
+
     /* Free I/O queue */
     if (soft->io_queue.sq) {
         kvpfree(soft->io_queue.sq, (uint)btoc(soft->io_queue.size * NVME_SQ_ENTRY_SIZE));
@@ -1409,14 +1423,23 @@ nvme_enable_interrupts(nvme_soft_t *soft)
     pciio_intr_line_t intr_line;
     device_desc_t dev_desc;
     pciio_info_t pciioinfo = pciio_info_get(soft->pci_vhdl);
-    vertex_hdl_t intr_conn = soft->pci_vhdl; // or use pcie_bridge_vhdl?
+    vertex_hdl_t intr_conn = soft->pci_vhdl;
 
+    /*
+        if we enumerated pci-pcie bridge it means we are on older irix (6.5.22?)
+        that doesn't understand bridges. we will attempt to hook up the interrupts 
+        to the bridge. 6.5.30 will just tell us to attach to unclaimed device and
+        seems to understand bridges so pcie_bridge_vhdl will end up 0 and hooking
+        up interrupts directly to pci_vhdl will work fine.
+    */
+    if (soft->pcie_bridge_vhdl) {
 #ifdef IP32
-    intr_conn = soft->pcie_bridge_vhdl;     
+        intr_conn = soft->pcie_bridge_vhdl;
 #endif
 #ifdef IP30
-    intr_conn = soft->pcie_bridge_vhdl;     
+        intr_conn = soft->pcie_bridge_vhdl;
 #endif
+    }
     pciioinfo = pciio_info_get(intr_conn);
     soft->interrupts_enabled = 0;
     intr_pin = (uchar_t)pciio_config_get(soft->pci_vhdl, PCI_INTR_PIN, 1);
@@ -1555,7 +1578,6 @@ nvme_attach(vertex_hdl_t conn)
             return -1;
         }
     }
-    pci_device_counter++;
     
 #ifdef xxIP30
     /*
@@ -1692,8 +1714,8 @@ nvme_attach(vertex_hdl_t conn)
     /* Enable bus master and memory space in PCI command register */
     command = (ushort_t)pciio_config_get(conn, PCI_CFG_COMMAND, 2);
     command |= PCI_CMD_BUS_MASTER | PCI_CMD_MEM_SPACE;
-    command |= PCI_CMD_MEMW_INV_ENAB;
-    command |= PCI_CMD_F_BK_BK_ENABLE;
+    //command |= PCI_CMD_MEMW_INV_ENAB;
+    //command |= PCI_CMD_F_BK_BK_ENABLE;
     pciio_config_set(conn, PCI_CFG_COMMAND, 2, command);
     bar0_size = pciio_info_bar_size_get(pciioinfo, 0);
     if (!bar0_size) {
@@ -2086,6 +2108,7 @@ nvme_detach(vertex_hdl_t conn)
     /* Stop completion processing thread */
     nvme_stop_poll_thread(soft);
 #endif
+
     /* Shutdown controller and free resources */
     nvme_shutdown(soft);
 
@@ -2242,6 +2265,296 @@ nvme_stop_poll_thread(nvme_soft_t *soft)
 
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme_stop_poll_thread: polling thread stopped");
+#endif
+}
+
+/*
+ * nvme_watchdog_timeout: Watchdog timer callback for missed interrupts
+ *
+ * This function is called by itimeout when the watchdog timer expires.
+ * It checks if there are outstanding commands and processes any completions
+ * that may have been missed due to lost interrupts.
+ *
+ * Called at interrupt level - must be fast and non-blocking.
+ */
+void
+nvme_watchdog_timeout(nvme_soft_t *soft)
+{
+    nvme_queue_t *q = &soft->io_queue;
+    int num_completions;
+
+    /* Clear the active flag atomically */
+    if (!compare_and_swap_int(&q->watchdog_active, 1, 0)) {
+        /* Watchdog was already cancelled or not active */
+        return;
+    }
+
+    /*
+     * Read outstanding counter with memory barrier to ensure we see
+     * the latest value across CPUs. We use atomicAddInt(ptr, 0) which
+     * atomically reads the value with full ll/sc memory barriers.
+     */
+    {
+        int outstanding = atomicAddInt((int *)&q->outstanding, 0);
+
+#ifdef NVME_DBG_EXTRA
+        cmn_err(CE_NOTE, "nvme_watchdog_timeout: checking for missed interrupts (outstanding=%d)",
+                outstanding);
+#endif
+
+        /* Check if there are outstanding commands */
+        if (outstanding > 0) {
+            /* Process any pending completions */
+            num_completions = nvme_process_completions(soft, q);
+
+#ifdef NVME_DBG
+            if (num_completions > 0) {
+                cmn_err(CE_WARN, "nvme_watchdog_timeout: recovered %d missed completions (outstanding now=%d)",
+                        num_completions, q->outstanding);
+            }
+#endif
+
+            /* If there are still outstanding commands, restart the watchdog */
+            if (q->outstanding > 0) {
+                nvme_watchdog_start(soft, q);
+            }
+        }
+    }
+}
+
+/*
+ * nvme_watchdog_start: Start the watchdog timer for a queue
+ *
+ * Called after submitting a command to ensure we catch missed interrupts.
+ * Uses atomic compare-and-swap to ensure only one watchdog is active at a time.
+ */
+void
+nvme_watchdog_start(nvme_soft_t *soft, nvme_queue_t *q)
+{
+    /* Only start if not already active (atomic test-and-set) */
+    if (!compare_and_swap_int((int *)&q->watchdog_active, 0, 1)) {
+        /* Watchdog is already running */
+        return;
+    }
+
+    /* Schedule the watchdog timer using fast clock for sub-tick resolution */
+    q->watchdog_id = fast_itimeout(nvme_watchdog_timeout,
+                                   (void *)soft,
+                                   drv_usectohz(NVME_WATCHDOG_TIMEOUT_US),
+                                   pldisk);
+
+#ifdef NVME_DBG_EXTRA
+    cmn_err(CE_NOTE, "nvme_watchdog_start: watchdog started for queue %d (timeout=%dus)",
+            q->qid, NVME_WATCHDOG_TIMEOUT_US);
+#endif
+}
+
+/*
+ * nvme_watchdog_stop: Stop the watchdog timer for a queue
+ *
+ * Called when all commands have completed or during shutdown.
+ */
+void
+nvme_watchdog_stop(nvme_queue_t *q)
+{
+    toid_t watchdog_id;
+
+    /* Atomically clear the active flag and get the ID */
+    if (!compare_and_swap_int((int *)&q->watchdog_active, 1, 0)) {
+        /* Watchdog is not active */
+        return;
+    }
+
+    /* Cancel the timeout if it hasn't fired yet */
+    watchdog_id = q->watchdog_id;
+    if (watchdog_id) {
+        untimeout(watchdog_id);
+        q->watchdog_id = 0;
+    }
+
+#ifdef NVME_DBG_EXTRA
+    cmn_err(CE_NOTE, "nvme_watchdog_stop: watchdog stopped for queue %d", q->qid);
+#endif
+}
+
+/*
+ * nvme_check_timeouts: Check all in-flight commands for timeouts
+ *
+ * Iterates through all CIDs in the I/O queue and checks if any have exceeded
+ * their timeout value (from sr_timeout field in scsi_request_t).
+ *
+ * For timed-out commands, issues an NVMe Abort command and updates the
+ * start_time to current lbolt to prevent re-aborting on subsequent checks.
+ *
+ * Called from timeout watchdog handler (nvme_timeout_watchdog_handler).
+ */
+void
+nvme_check_timeouts(nvme_soft_t *soft)
+{
+    time_t now = lbolt;
+    nvme_queue_t *q = &soft->io_queue;
+    int cid, i;
+    scsi_request_t *req;
+    time_t elapsed;
+    nvme_aborted_cmd_t *entry;
+
+    /* Age out stale aborted command entries (older than 1 second) */
+    mutex_lock(&soft->aborted_lock, PZERO);
+    if (soft->aborted_bitmap != 0) {
+        for (i = 0; i < NVME_ABORT_FIFO_SIZE; i++) {
+            /* Skip invalid entries */
+            if (!(soft->aborted_bitmap & (1U << i))) {
+                continue;
+            }
+
+            entry = &soft->aborted_cmds[i];
+
+            /* Check if entry has aged out (older than 1 second) */
+            if ((now - entry->abort_time) > NVME_ABORT_TIMEOUT_TICKS) {
+                /* Clear the stale entry */
+                soft->aborted_bitmap &= ~(1U << i);
+#ifdef NVME_DBG
+                cmn_err(CE_NOTE, "nvme_check_timeouts: aged out stale aborted entry at idx=%u "
+                        "(age %d ms)", i, (int)((now - entry->abort_time) * 1000 / HZ));
+#endif
+            }
+        }
+    }
+    mutex_unlock(&soft->aborted_lock);
+
+    /* Quick check: if no outstanding commands, nothing to do
+     * Use atomicAddInt(ptr, 0) to atomically read with memory barrier */
+    if (atomicAddInt((int *)&q->outstanding, 0) == 0) {
+        return;
+    }
+
+    /* Lock the I/O requests structure while we check */
+    mutex_lock(&soft->io_requests_lock, PZERO);
+
+    /* Early exit if all CIDs are free */
+    if (soft->io_cid_free_count == NVME_IO_QUEUE_SIZE) {
+        mutex_unlock(&soft->io_requests_lock);
+        return;
+    }
+
+    /* Iterate through all possible CIDs with bitmap optimization */
+    for (cid = 0; cid < NVME_IO_QUEUE_SIZE; ) {
+        uint_t word_idx = cid >> 5u;
+        uint_t word = soft->io_cid_bitmap[word_idx];
+
+        /* If entire word is zero (all free), skip 32 CIDs at once */
+        if (word == 0) {
+            cid += 32;
+            continue;
+        }
+
+        /* Check individual bit */
+        if (!(word & (1u << (cid & 0x1F)))) {
+            cid++;
+            continue;
+        }
+
+        req = soft->io_requests[cid].req;
+
+        /* Check if command has timed out */
+        elapsed = now - soft->io_requests[cid].start_time;
+
+        if (elapsed > req->sr_timeout) {
+            /* Command has timed out */
+            cmn_err(CE_WARN,
+                    "nvme: CID %d timeout after %d seconds (limit %d seconds)",
+                    cid, (int)(elapsed / HZ), (int)(req->sr_timeout / HZ));
+            cmn_err(CE_WARN,
+                    "nvme: CID %d timeout after %d seconds (limit %d seconds)",
+                    cid, (int)(elapsed / HZ), (int)(req->sr_timeout / HZ));
+
+            /* Store in aborted FIFO for retry detection */
+            nvme_aborted_fifo_add(soft, req);
+
+            /* Update start_time to prevent re-aborting this command */
+            soft->io_requests[cid].start_time = now;
+
+            nvme_admin_abort_command(soft, (ushort_t)cid);
+        }
+
+        cid++;
+    }
+
+    mutex_unlock(&soft->io_requests_lock);
+}
+
+/*
+ * nvme_timeout_watchdog_handler: Timeout watchdog timer callback
+ *
+ * Called periodically (every 100ms by default) to check for timed-out commands.
+ * Reschedules itself if there are outstanding commands.
+ */
+void
+nvme_timeout_watchdog_handler(nvme_soft_t *soft)
+{
+    nvme_queue_t *q = &soft->io_queue;
+
+    /* Clear the active flag atomically */
+    if (!compare_and_swap_int((int *)&soft->timeout_watchdog_active, 1, 0)) {
+        /* Watchdog was already cancelled or not active */
+        return;
+    }
+
+    /* Check for timeouts */
+    nvme_check_timeouts(soft);
+
+    nvme_timeout_watchdog_start(soft);
+}
+
+/*
+ * nvme_timeout_watchdog_start: Start the timeout watchdog timer
+ *
+ * Schedules periodic timeout checking (default 100ms = 10 Hz).
+ * Uses atomic compare-and-swap to ensure only one watchdog is active.
+ */
+void
+nvme_timeout_watchdog_start(nvme_soft_t *soft)
+{
+    /* Only start if not already active (atomic test-and-set) */
+    if (!compare_and_swap_int((int *)&soft->timeout_watchdog_active, 0, 1)) {
+        /* Timeout watchdog is already running */
+        return;
+    }
+
+    /* Schedule the timeout watchdog timer (100ms = HZ/10) */
+    soft->timeout_watchdog_id = fast_itimeout(nvme_timeout_watchdog_handler,
+                                              (void *)soft,
+                                              drv_usectohz(NVME_TIMEOUT_CHECK_INTERVAL_MS * 1000),
+                                              pldisk);
+
+#ifdef NVME_DBG_EXTRA
+    cmn_err(CE_NOTE, "nvme_timeout_watchdog_start: timeout watchdog started (%dms interval)",
+            NVME_TIMEOUT_CHECK_INTERVAL_MS);
+#endif
+}
+
+/*
+ * nvme_timeout_watchdog_stop: Stop the timeout watchdog timer
+ *
+ * Called during driver detach or shutdown.
+ */
+void
+nvme_timeout_watchdog_stop(nvme_soft_t *soft)
+{
+    /* Atomically clear the active flag */
+    if (!compare_and_swap_int((int *)&soft->timeout_watchdog_active, 1, 0)) {
+        /* Timeout watchdog is not active */
+        return;
+    }
+
+    /* Cancel the timeout if it hasn't fired yet */
+    if (soft->timeout_watchdog_id) {
+        untimeout(soft->timeout_watchdog_id);
+        soft->timeout_watchdog_id = 0;
+    }
+
+#ifdef NVME_DBG_EXTRA
+    cmn_err(CE_NOTE, "nvme_timeout_watchdog_stop: timeout watchdog stopped");
 #endif
 }
 

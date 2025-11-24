@@ -75,7 +75,8 @@ nvme_submit_cmd(nvme_soft_t *soft, nvme_queue_t *q, nvme_command_t *cmd)
 #endif
     /* Ring doorbell to notify controller */
     NVME_WR(soft, q->sq_doorbell, q->sq_tail);
-    pciio_write_gather_flush(soft->pci_vhdl); // make sure these post on IP30
+    /* Note: pciio_write_gather_flush removed - can cause PIO errors if controller locks up.
+     * XBow/Bridge handles write ordering; explicit flush not needed on IP35. */
 
 #ifdef NVME_DBG_EXTRA
     /* Verify the doorbell was written */

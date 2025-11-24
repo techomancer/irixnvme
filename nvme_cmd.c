@@ -1213,8 +1213,9 @@ nvme_prp_pool_init(nvme_soft_t *soft)
 {
     int pages;
 
-    /* Allocate pool memory (32 pages = 128KB) */
-    pages = NVME_PRP_POOL_SIZE * (NBPP / soft->nvme_page_size);
+    /* Allocate pool memory (64 pages = 256KB) */
+    pages = btop(NVME_PRP_POOL_SIZE * soft->nvme_page_size); 
+    
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme_prp_pool_init: allocating PRP pool (%d pages, %d bytes)",
             pages, pages * NBPP);
@@ -1279,7 +1280,7 @@ nvme_prp_pool_done(nvme_soft_t *soft)
     mutex_destroy(&soft->prp_pool_lock);
 
     /* Free the pool memory */
-    kvpfree(soft->prp_pool, NVME_PRP_POOL_SIZE);
+    kvpfree(soft->prp_pool,  btop(NVME_PRP_POOL_SIZE * soft->nvme_page_size));
     soft->prp_pool = NULL;
     soft->prp_pool_phys = 0;
     soft->prp_pool_bitmap = 0;

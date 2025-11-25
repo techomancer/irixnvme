@@ -39,6 +39,47 @@ nvme_set_success(scsi_request_t *req)
     req->sr_sensegotten = 0;
 }
 
+/*
+ * nvme_complete_request: Complete a SCSI request and call sr_notify callback
+ *
+ * This function handles the final step of request completion, including:
+ * - Cache invalidation for R10K+ speculative execution workaround (reads only)
+ * - Setting sr_ha to NULL (required before sr_notify per SCSI driver protocol)
+ * - Calling the sr_notify callback to notify upper layers
+ *
+ * R10K and later CPUs can speculatively fetch cache lines during DMA operations.
+ * Even though we invalidate the cache before DMA starts, speculative execution
+ * during the wait for DMA completion can pull stale data back into the cache.
+ * Therefore, we must invalidate again after DMA completes but before the upper
+ * layer accesses the data.
+ *
+ * Arguments:
+ *   req - SCSI request to complete
+ */
+void
+nvme_complete_request(scsi_request_t *req)
+{
+    /* If this IO resulted in a DMA from device to memory (disk read),
+     * then invalidate cache copies of the data.
+     * This only applies to read operations (SRF_DIR_IN).
+     */
+    if (req->sr_flags & SRF_DIR_IN) {
+        if (req->sr_flags & SRF_MAPBP) {
+            bp_dcache_wbinval(req->sr_bp);
+        } else if (req->sr_buffer && req->sr_buflen) {
+            dki_dcache_inval(req->sr_buffer, req->sr_buflen);
+        }
+    }
+
+    /* Set sr_ha to NULL - required by SCSI driver protocol before calling sr_notify */
+    req->sr_ha = NULL;
+
+    /* Notify upper layer that request is complete */
+    if (req->sr_notify) {
+        (*req->sr_notify)(req);
+    }
+}
+
 void
 nvme_read_completion(nvme_completion_t *cpl, nvme_queue_t *q)
 {
@@ -493,9 +534,10 @@ nvme_handle_io_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion_t 
 
     /* Notify SCSI layer - this completes the request
      * sr_ha is already 0 from the atomic decrement, no need to set it again
+     * nvme_complete_request() handles cache invalidation for R10K+ CPUs
      */
-    if (last && req->sr_notify) {
-        (*req->sr_notify)(req);
+    if (last) {
+        nvme_complete_request(req);
     }
 }
 

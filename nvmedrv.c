@@ -2453,7 +2453,7 @@ nvme_watchdog_timeout(nvme_soft_t *soft)
     int num_completions;
 
     /* Clear the active flag atomically */
-    if (!compare_and_swap_int(&q->watchdog_active, 1, 0)) {
+    if (!compare_and_swap_int((int *)&q->watchdog_active, 1, 0)) {
         /* Watchdog was already cancelled or not active */
         return;
     }

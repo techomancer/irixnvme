@@ -603,10 +603,7 @@ nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req)
         cmn_err(CE_WARN, "nvme_scsi_read_write: zero-length transfer rejected");
 #endif
         nvme_set_success(req);
-        if (req->sr_notify) {
-            req->sr_ha = NULL;
-            (*req->sr_notify)(req);
-        }
+        nvme_complete_request(req);
         return;
     }
 
@@ -757,10 +754,11 @@ error:
      * sr_ha is already 0 (NULL) from the atomic decrement
      */
     if (atomicAddInt((int *)&req->sr_ha, -1) == 0) {
-        /* All commands already completed - notify now */
-        if (req->sr_notify) {
-            (*req->sr_notify)(req);
-        }
+        /* All commands already completed - notify now
+         * Note: sr_ha is already NULL from the atomic decrement, but
+         * nvme_complete_request() will set it again for consistency
+         */
+        nvme_complete_request(req);
     }
 }
 
@@ -879,6 +877,10 @@ nvme_scsi_command(scsi_request_t *req)
     }
 
 done:
+    /* These are synchronous commands (INQUIRY, READ_CAPACITY, etc.) that use
+     * copyout() to return data, not DMA to sr_buffer. No cache invalidation needed.
+     * Only READ/WRITE commands (handled by nvme_scsi_read_write) need cache flush.
+     */
     if (req->sr_notify) {
         req->sr_ha = NULL;
         (*req->sr_notify)(req);

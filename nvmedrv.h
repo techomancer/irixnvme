@@ -486,6 +486,9 @@ void nvme_set_adapter_status(scsi_request_t *req, uint_t sr_status, u_char sr_sc
 void nvme_set_adapter_error(scsi_request_t *req);
 void nvme_set_success(scsi_request_t *req);
 void nvme_scsi_set_error(scsi_request_t *req, u_char sense_key, u_char asc, u_char ascq);
+
+/* Request completion with R10K+ cache invalidation workaround */
+void nvme_complete_request(scsi_request_t *req);
 /*
  * Function Prototypes - nvme_scsi.c
  */
@@ -622,6 +625,8 @@ extern volatile int nvme_intcount;
 #pragma set woff 3201
 #pragma set woff 1174
 #pragma set woff 1204
+#pragma set woff 1552
+
 
 extern int scsi_intr_pri;
 

@@ -191,6 +191,17 @@ nvme_init(void)
 
     /* If we are already registered, this is a reload */
     pciio_iterate("nvme_", nvme_reloadme);
+#ifdef NVME_BUILTIN
+    /*
+     * Register with wildcards (-1, -1) to get called for ALL PCI devices.
+     * We'll filter by class code in nvme_attach().
+     * IRIX CDL (Connection/Driver List) supports -1 wildcarding.
+     */
+    pciio_driver_register(PCIIO_VENDOR_ID_NONE,    /* -1 = wildcard vendor */
+                          PCIIO_DEVICE_ID_NONE,    /* -1 = wildcard device */
+                          "nvme_",
+                          0);
+#endif    
 }
 
 /*
@@ -206,6 +217,7 @@ nvme_unload(void)
     return 0;
 }
 
+#ifndef NVME_BUILTIN
 /*
  * nvme_reg: register the driver with the PCI infrastructure
  * NOTE: Should be called from _reg, not _init
@@ -244,6 +256,7 @@ nvme_unreg(void)
 
     return 0;
 }
+#endif
 
 #ifdef NVME_DBG_EXTRA
 /*
@@ -1951,9 +1964,15 @@ nvme_attach(vertex_hdl_t conn)
         slot = pciio_info_slot_get(pciioinfo);
 
         /* Find next available adapter number by scanning inventory 
-           FIXME - let ioconfig do it for us and use ioctl?
+           FIXME - let ioconfig do it for us and use ioctl when we are a module?
         */
         soft->adap = nvme_get_next_adapter_num();
+#if defined(IP30) && defined(NVME_BUILTIN)
+        // workaround for early boot, give first 2 slots to ql
+        if (soft->adap == 0) {
+            soft->adap = 2;
+        }
+#endif        
 
         cmn_err(CE_NOTE, "nvme_attach: PCI slot=%d, assigned adapter=%d", slot, soft->adap);
 
@@ -2043,6 +2062,17 @@ nvme_attach(vertex_hdl_t conn)
                 sprintf(edge_name, "%d", SCSI_EXT_CTLR(soft->adap));
 
                 hwgraph_link_add(path_relative, src_name, edge_name);
+
+#if defined(IP30) && defined(NVME_BUILTIN)
+                /*
+                 * Create link from /hw/ql/<N> to ctlr_vhdl (similar to ql driver)
+                 * This makes the device findable for root device discovery
+                 * The ql driver creates this to allow boot from SCSI controllers
+                 */
+                sprintf(src_name, "ql");
+                sprintf(edge_name, "%d", soft->adap);
+                hwgraph_link_add(path_relative, src_name, edge_name);
+#endif                
             }
         }
 

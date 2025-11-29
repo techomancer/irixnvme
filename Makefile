@@ -8,16 +8,24 @@
 #
 
 # Target CPU board - change this based on your system
-# Common values: IP32 (O2), IP30 (Octane), IP27 (Origin), IP22 (Indy/Indigo2)
+# Supportted values IP32 (O2) IP30 (Octane) IP35 (Fuel, Tezro, Origin 350)
 CPUBOARD=IP30
-
+BUILTIN=0
 # Include the IRIX kernel loadable I/O module makefile
 # This provides $(CC), $(LD), $(CFLAGS), $(LDFLAGS), $(ML), etc.
+
+#if $(BUILTIN) == "1"
+include /var/sysgen/Makefile.kernio
+BUILTIN_CFLAGS=-DNVME_BUILTIN
+#else
 include /var/sysgen/Makefile.kernloadio
+BUILTIN_CFLAGS=-DNVME_MODULE
+#endif
 
 COMMON_FLAGS=
 COMMON_LDFLAGS=-v
-COMMON_CFLAGS=-O3
+COMMON_CFLAGS=$(BUILTIN_CFLAGS)
+
 LDFLAGS_IP35=-nostdlib -64 -mips4
 LDFLAGS_IP30=-nostdlib -64 -mips4
 LDFLAGS_IP32=-nostdlib -n32 -mips3
@@ -98,9 +106,10 @@ clean:
 
 # Install target (for permanent installation, not implemented yet)
 install: $(MODULE)
-	@echo "Install target not yet implemented"
-	@echo "For now, use 'smake load' to load the driver dynamically"
-	@echo "Module would be installed to /var/sysgen/boot/"
+	cp master.d/nvme /var/sysgen/master.d/
+	cp nvme.o /var/sysgen/boot/
+	@echo add "USE: nvme" at the end of /var/sysgen/system/irix.sm
+	@echo and run autoconfig
 
 reboot:
 	shutdown -y -g0 -i6

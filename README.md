@@ -12,6 +12,18 @@ hinv -v
 fx
 enjoy
 
+now, if you like to live dangerously, for now on IP30
+format your nvme drive as root drive, clone your root
+set BUILTIN=1 in makefile
+make install
+add USE: nvme at the end of your /var/sysgen/system/irix.sm
+autoconf
+reboot
+in PROM
+setenv root dks2d0s0
+auto
+LOL
+
 ## Tested with
 - PLX and PERICOM PCI-PCIe bridges, (Sedna and Startech on Amazon), the PLX bridges are cheaper on eBay
 - your favorite no name brand passive PCIe-M.2 adapter

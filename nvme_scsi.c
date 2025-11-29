@@ -244,6 +244,7 @@ nvme_scsi_inquiry(nvme_soft_t *soft, scsi_request_t *req)
         }
 
         bcopy(inquiry_data, buffer, copy_len);
+#if 0
         {
             uint_t csts;
             cmn_err(CE_WARN, "nvme: outstanding reqs: %d,%d", soft->admin_queue.outstanding, soft->io_queue.outstanding);
@@ -256,6 +257,7 @@ nvme_scsi_inquiry(nvme_soft_t *soft, scsi_request_t *req)
             cmn_err(CE_CONT, "  SHST (Shutdown Status):      %u", (csts >> 2) & 3);
             cmn_err(CE_CONT, "  NSSRO (NVM Subsys Reset):    %u", (csts >> 4) & 1);
         }
+#endif
     }
 
     nvme_set_success(req);

@@ -771,7 +771,7 @@ nvme_get_translated_addr(nvme_soft_t *soft, alenlist_t alenlist, size_t maxlengt
     address = pciio_dmatrans_addr(soft->pci_vhdl, NULL, (paddr_t)address, length,
                                   PCIIO_DMA_DATA | DMATRANS64 | PCIIO_BYTE_STREAM
 #if defined(IP30) || defined(IP35)
-                                  | ((flags & NF_WRITE) ? PCIIO_NOPREFETCH : PCIBR_BARRIER)
+                                  | ((flags & NF_WRITE) ? PCIIO_PREFETCH : PCIBR_BARRIER)
 #endif
                                 );
 

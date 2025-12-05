@@ -3,32 +3,88 @@
 An NVMe driver for SGI IRIX 6.5, providing SCSI emulation to allow legacy IRIX disk drivers to work with modern NVMe SSDs.
 
 ## Building
-Install all the dev env and mipspro 7.4.4.
-Set CPUBOARD in Makefile to IP30, IP32 or IP35
-make
-make load
-make ioc
-hinv -v
-fx
-enjoy
 
-now, if you like to live dangerously, for now on IP30
-format your nvme drive as root drive, clone your root
-set BUILTIN=1 in makefile
-make install
-add USE: nvme at the end of your /var/sysgen/system/irix.sm
-autoconf
-reboot
-in PROM
-setenv root dks2d0s0
-auto
-LOL
+### Prerequisites
+
+Install the complete IRIX development environment:
+- MIPSPro 7.4.4 compiler (install 7.4, then patch to 7.4.4m)
+- Development Foundation 1.3
+- Development Libraries February 2002 (latest version)
+
+### Configuration
+
+Edit the [Makefile](Makefile) and set the `CPUBOARD` variable for your target system:
+
+```makefile
+CPUBOARD=IP30    # For Octane
+# or
+CPUBOARD=IP32    # For O2
+# or
+CPUBOARD=IP35    # For Fuel
+```
+
+### Build and Install
+
+```csh
+make           # Build the driver
+make load      # Load the kernel module
+make ioc       # Run ioconfig to discover partitions
+hinv -v        # Verify NVMe controller appears in inventory (as integral WDC33)
+```
+
+### Partition and Mount
+
+```csh
+fx             # Partition your NVMe drive
+mkfs           # Create filesystem
+# Or use IRIX GUI administration tools to initialize and mount
+```
+
+### Advanced: Boot from NVMe (IP30 only - live dangerously!)
+
+⚠️ **Warning**: This will modify your system boot configuration. Ensure you have backups!
+
+1. **Prepare the NVMe drive as root**:
+   ```csh
+   # Format NVMe drive and clone your existing root filesystem
+   ```
+
+2. **Edit the [Makefile](Makefile)**:
+   ```makefile
+   BUILTIN=1
+   ```
+
+3. **Install and configure**:
+   ```csh
+   make install
+   ```
+
+4. **Edit `/var/sysgen/system/irix.sm`** and add at the end:
+   ```
+   USE: nvme
+   ```
+
+5. **Rebuild kernel and reboot**:
+   ```csh
+   autoconf
+   reboot
+   ```
+
+6. **In PROM, set boot device**:
+   ```
+   setenv root dks2d0s0
+   auto
+   ```
+
+7. **LOL** (you're now booting IRIX 6.5 from NVMe!)
 
 ## Tested with
 - PLX and PERICOM PCI-PCIe bridges, (Sedna and Startech on Amazon), the PLX bridges are cheaper on eBay
 - your favorite no name brand passive PCIe-M.2 adapter
-- cheapo Liteon and Patriot NVME ssds. Samsung 990 EVO didnt show up on the bus though.
-- R12K/300 O2 and Dual R14k/600 Octane with shoebox.
+- cheapo Liteon and Patriot NVMe SSDs. Samsung 990 EVO didnt show up on the bus though.
+- R12K/300 O2 and Dual R14k/600 Octane with shoebox and Fuel (use two bottom PCI slots on Fuel for 66MHz).
+- by author IRIX 6.5.22 on O2 and Octane, 6.5.30 on Fuel
+- by others on O2, Octane, and O350
 
 ## Project Structure
 
@@ -130,18 +186,6 @@ May be somewhat different on Octane
 | WRITE(10) | NVMe Write command with LBA/count from CDB |
 | TEST UNIT READY | Check controller ready bit (CSTS.RDY) |
 
-## Building
-
-On an IRIX system with kernel build tools:
-
-```from your shell
-make           # Compile all modules
-make load      # Load driver into kernel
-make unload    # Unload driver (doesnt quite work, make reboot does)
-make clean     # Remove build artifacts
-make nt        # build test program
-
-```
 
 ## Testing
 

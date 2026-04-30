@@ -728,6 +728,14 @@ nvme_io_build_rw_command(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
     /* Set number of logical blocks (0-based, so subtract 1) */
     cmd->cdw12 = (num_blocks > 0) ? (num_blocks - 1) : 0;
 
+    /* Force Unit Access: instruct the controller to commit this write to
+     * non-volatile NAND storage before returning the completion entry.
+     * Controlled at runtime via NVME_IOC_SET_FUA; also enabled at boot
+     * when NVME_FUA_WRITES is compiled in.  Applied to writes only. */
+    if ((ps->flags & NF_WRITE) && soft->fua_enabled) {
+        cmd->cdw12 |= NVME_CDW12_FUA;
+    }
+
     /* Remaining fields already zeroed by bzero() above */
 
 #ifdef NVME_DBG_CMD

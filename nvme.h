@@ -185,6 +185,26 @@ typedef struct _nvme_error_log_entry {
 #define NVME_CMD_SGL            0x40
 
 /*
+ * Read/Write Command Dword 12 flags
+ */
+#define NVME_CDW12_FUA          (1U << 30)  /* Force Unit Access — commit to NAND before completion */
+
+/*
+ * Ioctl commands for the NVMe character control device (/hw/nvme/ctrl<N>).
+ *
+ * Usage (from userspace):
+ *   int fd = open("/hw/nvme/ctrl0", O_RDWR);
+ *   int val;
+ *   ioctl(fd, NVME_IOC_GET_VWC, &val);   -- returns 0=disabled, 1=enabled
+ *   val = 0;
+ *   ioctl(fd, NVME_IOC_SET_VWC, &val);   -- disable write cache
+ */
+#define NVME_IOC_GET_VWC    0x4E560001  /* get volatile write cache state */
+#define NVME_IOC_SET_VWC    0x4E560002  /* set volatile write cache: 0=off, 1=on */
+#define NVME_IOC_GET_FUA    0x4E560003  /* get Force Unit Access state */
+#define NVME_IOC_SET_FUA    0x4E560004  /* set Force Unit Access: 0=off, 1=on */
+
+/*
  * Queue sizes and scatter-gather limits
  */
 #define NVME_SQ_ENTRY_SIZE      64      /* Submission Queue Entry size */

@@ -40,7 +40,7 @@ mkfs           # Create filesystem
 # Or use IRIX GUI administration tools to initialize and mount
 ```
 
-### Advanced: Boot from NVMe (IP30 only - live dangerously!)
+### Advanced: Boot from NVMe (IP30 & IP32 only - live dangerously!)
 
 ⚠️ **Warning**: This will modify your system boot configuration. Ensure you have backups!
 
@@ -53,6 +53,8 @@ mkfs           # Create filesystem
    ```makefile
    BUILTIN=1
    ```
+
+   If using IP32, set either DISABLE_WC or ENABLE_FUA to 1. These can be changed at runtime via nvmectl utility.
 
 3. **Install and configure**:
    ```csh

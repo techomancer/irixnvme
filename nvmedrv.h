@@ -30,6 +30,7 @@
 
 #if defined(IP32)
 #define NVME_COMPLETION_INTERRUPT
+#define NVME_QUEUE_BYTESWAP
 #define DMATRANS64 0
 #endif
 
@@ -123,6 +124,7 @@ void bp_heart_invalidate_war(struct buf *bp);
 /*
  * Driver Configuration
  */
+#define NVME_MAX_CTLR           8       /* Maximum NVMe controllers supported */
 #define NVME_ADMIN_QUEUE_SIZE   64      /* Admin queue depth */
 #define NVME_IO_QUEUE_SIZE      512     /* I/O queue depth */
 #define NVME_WATCHDOG_TIMEOUT_US 2000   /* Watchdog timeout in microseconds (2ms) */
@@ -267,6 +269,7 @@ typedef struct nvme_soft_s {
     vertex_hdl_t        pci_vhdl;         /* PCI connection vertex */
     vertex_hdl_t        scsi_vhdl;        /* SCSI controller vertex */
     vertex_hdl_t        pcie_bridge_vhdl; /* PCI connection vertex */
+    vertex_hdl_t        ctrl_vhdl;        /* character control device vertex (/hw/nvme/ctrl<N>) */
 
     /* Controller registers (BAR0) */
     volatile uchar_t   *bar0;           /* BAR0 base address */
@@ -364,6 +367,8 @@ typedef struct nvme_soft_s {
      * Array indexed by FID - stores capability bitmask showing which bits are changeable.
      * Value of 0 means feature not supported or not changeable. */
     uint_t              features[16];               /* Features 0x00-0x0F */
+    int                 vwc_enabled;                /* current volatile write cache state: 0=off, 1=on */
+    int                 fua_enabled;                /* Force Unit Access on all writes: 0=off, 1=on */
 
     /* Optional NVMe Command Support (ONCS) from Identify Controller */
     uchar_t             oncs_compare;               /* Bit 0: Compare command supported */

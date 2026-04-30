@@ -17,6 +17,13 @@ char *nvme_mversion = M_VERSION;
  */
 int nvme_devflag = D_MP;
 
+/*
+ * Global soft-state table indexed by adapter number.
+ * Populated in nvme_attach(), cleared in nvme_detach_attached_soft().
+ * Used by nvme_ioctl() to map minor device number → soft state.
+ */
+static nvme_soft_t *nvme_ctlr_softmap[NVME_MAX_CTLR];
+
 /* NVMe PCI Class Codes */
 #define PC_CLASS_STORAGE       0x01        /* Mass Storage Controller */
 #define PCI_SUBCLASS_NVM        0x08        /* Non-Volatile Memory */
@@ -118,6 +125,293 @@ nvme_get_next_adapter_num(void)
     return max_ctlr + 1;
 }
 
+#if defined(IP32)
+#define NVME_IP32_ALIAS_SLOTS 64
+#define NVME_IP32_CANDIDATE_SLOTS 64
+#define NVME_IP32_FINALIZE_DELAY_US 500000 /* Wait 500ms of quiet before final attach pass */
+
+typedef struct nvme_ip32_alias_entry_s {
+    int             in_use;
+    char            serial[21];  /* Trimmed ASCII serial key */
+    vertex_hdl_t    conn;        /* Currently attached alias for this serial */
+    nvme_soft_t    *soft;        /* Attached soft state for this alias */
+    int             slot;        /* PCI slot of attached alias */
+} nvme_ip32_alias_entry_t;
+
+static nvme_ip32_alias_entry_t nvme_ip32_alias_table[NVME_IP32_ALIAS_SLOTS];
+
+typedef struct nvme_ip32_candidate_entry_s {
+    int             in_use;
+    char            serial[21];  /* Trimmed ASCII serial key */
+    vertex_hdl_t    conn;        /* Latest enumerated alias for this serial */
+    int             slot;        /* Slot for latest alias */
+    nvme_soft_t    *soft;        /* Pre-initialized soft state saved from discovery phase */
+} nvme_ip32_candidate_entry_t;
+
+static nvme_ip32_candidate_entry_t nvme_ip32_candidate_table[NVME_IP32_CANDIDATE_SLOTS];
+static mutex_t         nvme_ip32_candidate_lock;
+static int             nvme_ip32_candidate_lock_ready = 0;
+static sema_t          nvme_ip32_finalize_sema;
+static volatile int    nvme_ip32_finalize_shutdown = 0;
+static volatile int    nvme_ip32_finalize_thread_running = 0;
+static volatile uint_t nvme_ip32_candidate_gen = 0;
+static volatile int    nvme_ip32_finalize_active = 0;
+static volatile vertex_hdl_t nvme_ip32_finalize_conn = (vertex_hdl_t)0;
+static volatile nvme_soft_t *nvme_ip32_finalize_soft = NULL; /* Pre-init soft for current finalize conn */
+
+static void
+nvme_ip32_candidate_lock_init_once(void)
+{
+    if (!nvme_ip32_candidate_lock_ready) {
+        init_mutex(&nvme_ip32_candidate_lock, MUTEX_DEFAULT, "nvme_ip32cand", 0);
+        nvme_ip32_candidate_lock_ready = 1;
+    }
+}
+
+static void
+nvme_ip32_build_serial_key(const uchar_t *serial_in, char *serial_out, size_t serial_out_len)
+{
+    int end;
+    int i;
+
+    if (!serial_out || serial_out_len == 0) {
+        return;
+    }
+
+    serial_out[0] = '\0';
+    if (!serial_in) {
+        return;
+    }
+
+    end = 20;
+    while (end > 0) {
+        uchar_t c = serial_in[end - 1];
+        if (c != ' ' && c != '\0') {
+            break;
+        }
+        end--;
+    }
+
+    if (end <= 0) {
+        return;
+    }
+
+    if (end >= (int)serial_out_len) {
+        end = (int)serial_out_len - 1;
+    }
+
+    for (i = 0; i < end; i++) {
+        serial_out[i] = (char)serial_in[i];
+    }
+    serial_out[end] = '\0';
+}
+
+static int
+nvme_ip32_alias_find(const char *serial_key)
+{
+    int i;
+
+    if (!serial_key || serial_key[0] == '\0') {
+        return -1;
+    }
+
+    for (i = 0; i < NVME_IP32_ALIAS_SLOTS; i++) {
+        if (nvme_ip32_alias_table[i].in_use &&
+            strcmp(nvme_ip32_alias_table[i].serial, serial_key) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void
+nvme_ip32_alias_set_conn(const char *serial_key, vertex_hdl_t conn, nvme_soft_t *soft, int slot)
+{
+    int idx;
+    int i;
+    size_t len;
+
+    if (!serial_key || serial_key[0] == '\0') {
+        return;
+    }
+
+    idx = nvme_ip32_alias_find(serial_key);
+    if (idx >= 0) {
+        nvme_ip32_alias_table[idx].conn = conn;
+        nvme_ip32_alias_table[idx].soft = soft;
+        nvme_ip32_alias_table[idx].slot = slot;
+        return;
+    }
+
+    for (i = 0; i < NVME_IP32_ALIAS_SLOTS; i++) {
+        if (!nvme_ip32_alias_table[i].in_use) {
+            nvme_ip32_alias_table[i].in_use = 1;
+            nvme_ip32_alias_table[i].conn = conn;
+            nvme_ip32_alias_table[i].soft = soft;
+            nvme_ip32_alias_table[i].slot = slot;
+            bzero(nvme_ip32_alias_table[i].serial, sizeof(nvme_ip32_alias_table[i].serial));
+            len = strlen(serial_key);
+            if (len >= sizeof(nvme_ip32_alias_table[i].serial)) {
+                len = sizeof(nvme_ip32_alias_table[i].serial) - 1;
+            }
+            bcopy(serial_key, nvme_ip32_alias_table[i].serial, len);
+            nvme_ip32_alias_table[i].serial[len] = '\0';
+            return;
+        }
+    }
+
+    cmn_err(CE_WARN, "nvme_attach: IP32 serial alias table full, cannot track SN=%s",
+            serial_key);
+}
+
+static void
+nvme_ip32_alias_clear_conn(const char *serial_key, vertex_hdl_t conn)
+{
+    int idx;
+
+    idx = nvme_ip32_alias_find(serial_key);
+    if (idx < 0) {
+        return;
+    }
+
+    if (nvme_ip32_alias_table[idx].conn != conn) {
+        return;
+    }
+
+    bzero(&nvme_ip32_alias_table[idx], sizeof(nvme_ip32_alias_table[idx]));
+}
+
+static int
+nvme_ip32_candidate_find_locked(const char *serial_key)
+{
+    int i;
+
+    if (!serial_key || serial_key[0] == '\0') {
+        return -1;
+    }
+
+    for (i = 0; i < NVME_IP32_CANDIDATE_SLOTS; i++) {
+        if (nvme_ip32_candidate_table[i].in_use &&
+            strcmp(nvme_ip32_candidate_table[i].serial, serial_key) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/* Forward declaration needed by nvme_ip32_candidate_set_latest */
+static void nvme_ip32_cleanup_staged_soft(nvme_soft_t *soft);
+
+static int
+nvme_ip32_candidate_set_latest(const char *serial_key, vertex_hdl_t conn, int slot,
+                                nvme_soft_t *soft)
+{
+    int idx;
+    int i;
+    size_t len;
+    nvme_soft_t *old_soft;
+
+    if (!serial_key || serial_key[0] == '\0') {
+        return -1;
+    }
+
+    if (!nvme_ip32_candidate_lock_ready) {
+        nvme_ip32_candidate_lock_init_once();
+    }
+
+    mutex_lock(&nvme_ip32_candidate_lock, PZERO);
+
+    idx = nvme_ip32_candidate_find_locked(serial_key);
+    if (idx < 0) {
+        for (i = 0; i < NVME_IP32_CANDIDATE_SLOTS; i++) {
+            if (!nvme_ip32_candidate_table[i].in_use) {
+                idx = i;
+                bzero(&nvme_ip32_candidate_table[idx], sizeof(nvme_ip32_candidate_table[idx]));
+                nvme_ip32_candidate_table[idx].in_use = 1;
+                len = strlen(serial_key);
+                if (len >= sizeof(nvme_ip32_candidate_table[idx].serial)) {
+                    len = sizeof(nvme_ip32_candidate_table[idx].serial) - 1;
+                }
+                bcopy(serial_key, nvme_ip32_candidate_table[idx].serial, len);
+                nvme_ip32_candidate_table[idx].serial[len] = '\0';
+                break;
+            }
+        }
+    }
+
+    if (idx < 0) {
+        mutex_unlock(&nvme_ip32_candidate_lock);
+        cmn_err(CE_WARN, "nvme_attach: IP32 candidate table full, cannot stage SN=%s",
+                serial_key);
+        return -1;
+    }
+
+    old_soft = NULL;
+    if (nvme_ip32_candidate_table[idx].conn != (vertex_hdl_t)0 &&
+        nvme_ip32_candidate_table[idx].conn != conn) {
+        cmn_err(CE_NOTE,
+                "nvme_attach: IP32 duplicate candidate for SN=%s, replacing conn 0x%x (slot %d) with 0x%x (slot %d)",
+                serial_key,
+                (uint_t)nvme_ip32_candidate_table[idx].conn,
+                nvme_ip32_candidate_table[idx].slot,
+                (uint_t)conn,
+                slot);
+        /* Capture old soft to free after releasing the lock */
+        old_soft = nvme_ip32_candidate_table[idx].soft;
+        nvme_ip32_candidate_table[idx].soft = NULL;
+    }
+
+    nvme_ip32_candidate_table[idx].conn = conn;
+    nvme_ip32_candidate_table[idx].slot = slot;
+    nvme_ip32_candidate_table[idx].soft = soft;
+    nvme_ip32_candidate_gen++;
+
+    mutex_unlock(&nvme_ip32_candidate_lock);
+
+    /* Free displaced soft outside the lock to avoid holding it during shutdown */
+    if (old_soft != NULL) {
+        nvme_ip32_cleanup_staged_soft(old_soft);
+    }
+
+    return 0;
+}
+
+static int
+nvme_ip32_candidate_collect(vertex_hdl_t *conns, nvme_soft_t **softs, int max_conns)
+{
+    int i;
+    int count = 0;
+
+    if (!conns || !softs || max_conns <= 0) {
+        return 0;
+    }
+
+    if (!nvme_ip32_candidate_lock_ready) {
+        return 0;
+    }
+
+    mutex_lock(&nvme_ip32_candidate_lock, PZERO);
+    for (i = 0; i < NVME_IP32_CANDIDATE_SLOTS && count < max_conns; i++) {
+        if (!nvme_ip32_candidate_table[i].in_use) {
+            continue;
+        }
+        if (nvme_ip32_candidate_table[i].conn == (vertex_hdl_t)0) {
+            continue;
+        }
+        conns[count] = nvme_ip32_candidate_table[i].conn;
+        softs[count] = nvme_ip32_candidate_table[i].soft; /* Transfer ownership */
+        nvme_ip32_candidate_table[i].soft = NULL;
+        count++;
+        bzero(&nvme_ip32_candidate_table[i], sizeof(nvme_ip32_candidate_table[i]));
+    }
+    mutex_unlock(&nvme_ip32_candidate_lock);
+
+    return count;
+}
+#endif
+
 /* =====================================================================
  *    FUNCTION TABLE OF CONTENTS
  */
@@ -129,6 +423,17 @@ int         nvme_unreg(void);
 
 int         nvme_attach(vertex_hdl_t conn);
 int         nvme_detach(vertex_hdl_t conn);
+static int  nvme_detach_attached_soft(nvme_soft_t *soft, vertex_hdl_t conn, int fast_alias);
+static int  nvme_shutdown_ex(nvme_soft_t *soft, int fast_alias);
+#if defined(IP32)
+/* nvme_ip32_cleanup_staged_soft forward-declared earlier */
+static void nvme_ip32_free_replaced_soft(nvme_soft_t *soft);
+static void nvme_ip32_do_soft_swap(int alias_idx, vertex_hdl_t new_conn, nvme_soft_t *new_soft);
+static void nvme_ip32_finalize_candidates(void);
+static void nvme_ip32_finalize_thread(void *arg);
+static void nvme_ip32_start_finalize_thread(void);
+static void nvme_ip32_stop_finalize_thread(void);
+#endif
 
 static pciio_iter_f nvme_reloadme;
 static pciio_iter_f nvme_unloadme;
@@ -212,10 +517,368 @@ nvme_unload(void)
 {
     cmn_err(CE_NOTE, "nvme_unload: unloading NVMe driver");
 
+#if defined(IP32)
+    nvme_ip32_stop_finalize_thread();
+#endif
+
     pciio_iterate("nvme_", nvme_unloadme);
 
     return 0;
 }
+
+#if defined(IP32)
+static void
+nvme_ip32_cleanup_staged_soft(nvme_soft_t *soft)
+{
+    if (!soft) {
+        return;
+    }
+
+    nvme_shutdown_ex(soft, 1);
+    if (soft->bar0_map) {
+        pciio_piomap_free(soft->bar0_map);
+        soft->bar0_map = 0;
+    }
+    DEL(soft);
+}
+
+/*
+ * nvme_ip32_free_replaced_soft: Release kernel resources for a soft state that
+ * has been superseded by a soft swap.
+ *
+ * Unlike nvme_ip32_cleanup_staged_soft this intentionally does NOT write any
+ * NVMe MMIO registers.  The controller hardware has already been reset and
+ * reconfigured by the replacement soft's nvme_sanitize()+nvme_initialize(), so
+ * touching CC/CSTS here would only disturb the live controller.
+ */
+static void
+nvme_ip32_free_replaced_soft(nvme_soft_t *soft)
+{
+    if (!soft) {
+        return;
+    }
+
+    /* Cancel kernel timer callbacks - no hardware access */
+    nvme_timeout_watchdog_stop(soft);
+    nvme_watchdog_stop(&soft->io_queue);
+    nvme_watchdog_stop(&soft->admin_queue);
+
+    /* Free utility buffer */
+    if (soft->utility_buffer) {
+        kvpfree(soft->utility_buffer, 1);
+        soft->utility_buffer = NULL;
+    }
+
+    /* Free alenlist */
+    if (soft->alenlist) {
+        mutex_destroy(&soft->alenlist_lock);
+        alenlist_destroy(soft->alenlist);
+        soft->alenlist = NULL;
+    }
+
+    /* Free PRP pool */
+    nvme_prp_pool_done(soft);
+
+    /* Destroy command tracking locks */
+    mutex_destroy(&soft->io_requests_lock);
+    mutex_destroy(&soft->aborted_lock);
+
+#ifdef NVME_UTILBUF_USEDMAP
+    pciio_dmamap_free(soft->utility_buffer_dmamap);
+#endif
+
+    /* Free I/O queue descriptor ring memory */
+    if (soft->io_queue.sq) {
+        kvpfree(soft->io_queue.sq, (uint)btoc(soft->io_queue.size * NVME_SQ_ENTRY_SIZE));
+        soft->io_queue.sq = NULL;
+    }
+    if (soft->io_queue.cq) {
+        kvpfree(soft->io_queue.cq, (uint)btoc(soft->io_queue.size * NVME_CQ_ENTRY_SIZE));
+        soft->io_queue.cq = NULL;
+    }
+    mutex_destroy(&soft->io_queue.lock);
+
+    /* Free admin queue descriptor ring memory */
+    if (soft->admin_queue.sq) {
+        kvpfree(soft->admin_queue.sq, (uint)btoc(soft->admin_queue.size * NVME_SQ_ENTRY_SIZE));
+        soft->admin_queue.sq = NULL;
+    }
+    if (soft->admin_queue.cq) {
+        kvpfree(soft->admin_queue.cq, (uint)btoc(soft->admin_queue.size * NVME_CQ_ENTRY_SIZE));
+        soft->admin_queue.cq = NULL;
+    }
+    mutex_destroy(&soft->admin_queue.lock);
+
+    /* Release the replaced conn's BAR0 PIO mapping */
+    if (soft->bar0_map) {
+        pciio_piomap_free(soft->bar0_map);
+        soft->bar0_map = 0;
+    }
+
+    /*
+     * INTENTIONALLY do not DEL(soft) here.
+     *
+     * The IRIX SCSI layer (dksc) stores the scsi_target_info_t pointer
+     * returned by nvme_scsi_info() — which is &soft->tinfo, an address
+     * inside this struct — and continues to dereference it (for si_inq,
+     * si_sense, etc.) long after attachment.  Freeing the struct would
+     * leave dksc with a dangling pointer and cause a tlbmiss panic.
+     *
+     * The struct is therefore intentionally left allocated as a "zombie":
+     * all expensive NVMe sub-resources above have been freed, the
+     * watchdog is stopped, and bar0_map is gone, so no hardware activity
+     * can occur through this soft again.  The struct body (~16 KB with the
+     * embedded io_requests[512] array) stays mapped so that any cached
+     * pointer into it (tinfo, inq_data, sense_data) remains valid.
+     *
+     * With at most ~12 alias appearances across 4 drives, the total
+     * zombie overhead is under 200 KB — acceptable for a boot driver.
+     */
+    soft->initialized = 0;
+    soft->bar0 = NULL;
+}
+
+/*
+ * nvme_ip32_do_soft_swap: Replace the live soft state for an already-registered
+ * controller with a freshly initialised one from the latest PCI alias.
+ *
+ * The SCSI controller vertex, adapter number, and all hwgraph paths remain
+ * unchanged; only the nvme_soft_t pointer stored in SCI_INFO is updated so
+ * that subsequent SCSI commands use the new conn's hardware queues.
+ *
+ * The old soft's hardware was already reset by the new soft's
+ * nvme_sanitize()+nvme_initialize(), so we release old soft's resources
+ * without writing to NVMe MMIO.
+ */
+static void
+nvme_ip32_do_soft_swap(int alias_idx, vertex_hdl_t new_conn, nvme_soft_t *new_soft)
+{
+    nvme_soft_t      *old_soft;
+    scsi_ctlr_info_t *scsi_info;
+
+    if (!new_soft) {
+        cmn_err(CE_WARN, "nvme: IP32 soft swap: new_soft is NULL for conn 0x%x",
+                (uint_t)new_conn);
+        return;
+    }
+
+    old_soft = nvme_ip32_alias_table[alias_idx].soft;
+    if (!old_soft) {
+        /* No live old soft to swap; release new_soft to avoid a leak */
+        nvme_ip32_cleanup_staged_soft(new_soft);
+        return;
+    }
+
+    /* Inherit the SCSI registration from the old soft */
+    new_soft->scsi_vhdl = old_soft->scsi_vhdl;
+    new_soft->adap      = old_soft->adap;
+
+    /* Transfer character control device ownership to the new soft.
+     * old_soft->ctrl_vhdl's device_info still points to old_soft; update it
+     * now so that nvme_open/nvme_ioctl resolve to the live soft after the swap.
+     * Do this before nvme_ip32_free_replaced_soft() zeroes old_soft->initialized. */
+    new_soft->ctrl_vhdl = old_soft->ctrl_vhdl;
+    old_soft->ctrl_vhdl = GRAPH_VERTEX_NONE;
+    if (new_soft->ctrl_vhdl != GRAPH_VERTEX_NONE)
+        device_info_set(new_soft->ctrl_vhdl, new_soft);
+
+    /* Keep global softmap in sync */
+    if (new_soft->adap < NVME_MAX_CTLR)
+        nvme_ctlr_softmap[new_soft->adap] = new_soft;
+
+    /* Redirect the SCSI layer to the new hardware state */
+    scsi_info = scsi_ctlr_info_get(new_soft->scsi_vhdl);
+    if (scsi_info) {
+        SCI_INFO(scsi_info) = new_soft;
+    } else {
+        cmn_err(CE_WARN,
+                "nvme: IP32 soft swap: scsi_ctlr_info_get returned NULL "
+                "(adap=%d vhdl=0x%x)",
+                new_soft->adap, (uint_t)new_soft->scsi_vhdl);
+    }
+
+    /* Register PCI error handler for the new conn */
+    pciio_error_register(new_conn, nvme_error_handler, new_soft);
+
+    /* Arm watchdog and mark not quiesced for new soft */
+    nvme_timeout_watchdog_start(new_soft);
+    new_soft->quiesce_state = NO_QUIESCE_IN_PROGRESS;
+
+    cmn_err(CE_NOTE,
+            "nvme: IP32 soft swap: adapter %d updated to conn 0x%x",
+            new_soft->adap, (uint_t)new_conn);
+
+    /* Release old soft resources without touching hardware */
+    nvme_ip32_free_replaced_soft(old_soft);
+
+    /* Update alias table */
+    nvme_ip32_alias_table[alias_idx].soft = new_soft;
+    nvme_ip32_alias_table[alias_idx].conn = new_conn;
+}
+
+static void
+nvme_ip32_finalize_candidates(void)
+{
+    vertex_hdl_t conns[NVME_IP32_CANDIDATE_SLOTS];
+    nvme_soft_t *softs[NVME_IP32_CANDIDATE_SLOTS];
+    int count;
+    int i;
+
+    count = nvme_ip32_candidate_collect(conns, softs, NVME_IP32_CANDIDATE_SLOTS);
+    if (count <= 0) {
+        return;
+    }
+
+    cmn_err(CE_NOTE, "nvme_attach: IP32 finalize pass attaching %d controller candidate(s)",
+            count);
+
+    nvme_ip32_finalize_active = 1;
+    for (i = 0; i < count; i++) {
+        char serial_key[21];
+        int alias_idx;
+
+        /* Derive serial from the staged soft so we can check the alias table */
+        if (softs[i] != NULL) {
+            nvme_ip32_build_serial_key(softs[i]->serial, serial_key, sizeof(serial_key));
+        } else {
+            serial_key[0] = '\0';
+        }
+
+        alias_idx = (serial_key[0] != '\0') ? nvme_ip32_alias_find(serial_key) : -1;
+
+        if (alias_idx < 0) {
+            /*
+             * Controller not yet registered: do full SCSI attach via the
+             * finalize fast-path (skips sanitize+initialize since soft is
+             * pre-initialised from the discovery phase).
+             */
+            nvme_ip32_finalize_conn = conns[i];
+            nvme_ip32_finalize_soft = softs[i]; /* May be NULL if pre-init unavailable */
+            (void)nvme_attach(conns[i]);
+            nvme_ip32_finalize_conn = (vertex_hdl_t)0;
+            /* If nvme_attach didn't consume the pre-init soft (early failure),
+             * clean it up to avoid leaking. */
+            if (nvme_ip32_finalize_soft != NULL) {
+                nvme_ip32_cleanup_staged_soft((nvme_soft_t *)nvme_ip32_finalize_soft);
+                nvme_ip32_finalize_soft = NULL;
+            }
+        } else {
+            /*
+             * Controller already registered under an earlier alias: swap the
+             * soft state so the newest conn's hardware is used for I/O.
+             * The SCSI/hwgraph registration stays intact.
+             */
+            nvme_ip32_do_soft_swap(alias_idx, conns[i], softs[i]);
+        }
+    }
+    nvme_ip32_finalize_active = 0;
+}
+
+static void
+nvme_ip32_finalize_thread(void *arg)
+{
+    uint_t snapshot_gen;
+    (void)arg;
+
+    nvme_ip32_finalize_thread_running = 1;
+    while (!nvme_ip32_finalize_shutdown) {
+        psema(&nvme_ip32_finalize_sema, PZERO);
+        if (nvme_ip32_finalize_shutdown) {
+            break;
+        }
+
+        for (;;) {
+            snapshot_gen = nvme_ip32_candidate_gen;
+            delay(drv_usectohz(NVME_IP32_FINALIZE_DELAY_US));
+            if (nvme_ip32_finalize_shutdown) {
+                break;
+            }
+            if (snapshot_gen == nvme_ip32_candidate_gen) {
+                break;
+            }
+        }
+
+        if (nvme_ip32_finalize_shutdown) {
+            break;
+        }
+
+        nvme_ip32_finalize_candidates();
+
+        /* Drain any vsema() signals that accumulated during enumeration so we
+         * don't re-enter the finalize loop unnecessarily (each extra wakeup
+         * would add one more NVME_IP32_FINALIZE_DELAY_US of idle wait). */
+        while (cpsema(&nvme_ip32_finalize_sema))
+            ;
+    }
+    nvme_ip32_finalize_thread_running = 0;
+}
+
+static void
+nvme_ip32_start_finalize_thread(void)
+{
+    if (nvme_ip32_finalize_thread_running) {
+        return;
+    }
+
+    nvme_ip32_candidate_lock_init_once();
+    bzero(nvme_ip32_candidate_table, sizeof(nvme_ip32_candidate_table));
+    initnsema(&nvme_ip32_finalize_sema, 0, "nvme_ip32f");
+    nvme_ip32_candidate_gen = 0;
+    nvme_ip32_finalize_shutdown = 0;
+    nvme_ip32_finalize_active = 0;
+    nvme_ip32_finalize_conn = (vertex_hdl_t)0;
+    nvme_ip32_finalize_soft = NULL;
+    nvme_ip32_finalize_thread_running = 1;
+
+    sthread_create("nvme_ip32_finalize",
+                    NULL, 2 * KTHREAD_DEF_STACKSZ,
+                    0,
+                    scsi_intr_pri,
+                    KT_PS,
+                    nvme_ip32_finalize_thread,
+                    0,
+                    0, 0, 0);
+}
+
+static void
+nvme_ip32_stop_finalize_thread(void)
+{
+    int timeout;
+
+    if (!nvme_ip32_finalize_thread_running) {
+        return;
+    }
+
+    nvme_ip32_finalize_shutdown = 1;
+    vsema(&nvme_ip32_finalize_sema);
+
+    timeout = 500; /* 5 seconds max */
+    while (nvme_ip32_finalize_thread_running && timeout-- > 0) {
+        delay(drv_usectohz(10000));
+    }
+
+    freesema(&nvme_ip32_finalize_sema);
+
+    if (nvme_ip32_candidate_lock_ready) {
+        int i;
+        mutex_lock(&nvme_ip32_candidate_lock, PZERO);
+        for (i = 0; i < NVME_IP32_CANDIDATE_SLOTS; i++) {
+            if (nvme_ip32_candidate_table[i].soft != NULL) {
+                nvme_ip32_cleanup_staged_soft(nvme_ip32_candidate_table[i].soft);
+                nvme_ip32_candidate_table[i].soft = NULL;
+            }
+        }
+        bzero(nvme_ip32_candidate_table, sizeof(nvme_ip32_candidate_table));
+        mutex_unlock(&nvme_ip32_candidate_lock);
+    }
+    if (nvme_ip32_finalize_soft != NULL) {
+        nvme_ip32_cleanup_staged_soft((nvme_soft_t *)nvme_ip32_finalize_soft);
+        nvme_ip32_finalize_soft = NULL;
+    }
+    nvme_ip32_finalize_active = 0;
+    nvme_ip32_finalize_conn = (vertex_hdl_t)0;
+}
+#endif
 
 #ifndef NVME_BUILTIN
 /*
@@ -251,6 +914,10 @@ int
 nvme_unreg(void)
 {
     cmn_err(CE_NOTE, "nvme_unreg: unregistering NVMe driver");
+
+#if defined(IP32)
+    nvme_ip32_stop_finalize_thread();
+#endif
 
     pciio_driver_unregister("nvme_");
 
@@ -860,8 +1527,10 @@ nvme_initialize(nvme_soft_t *soft)
 
     soft->min_page_size = (uint_t)((soft->cap >> 48) & 0xF);
     soft->max_page_size = (uint_t)((soft->cap >> 52) & 0xF);
+#ifdef NVME_ATTACH_VERBOSE
     cmn_err(CE_NOTE, "nvme: system page size %u supported range %u-%u",
-            NBPP, 1u << (soft->min_page_size + 12), 1u << (soft->max_page_size + 12));            
+            NBPP, 1u << (soft->min_page_size + 12), 1u << (soft->max_page_size + 12));
+#endif
 #ifdef NVME_FORCE_4K
         soft->nvme_page_size = 4096;
         soft->nvme_page_shift = 12;
@@ -1222,6 +1891,69 @@ nvme_initialize(nvme_soft_t *soft)
         /* Non-fatal - continue initialization even if feature query fails */
     }
 
+    /*
+     * Disable the volatile write cache (FID 0x06, WCE bit = 0).
+     *
+     * IRIX does not call any driver entry point during a clean system
+     * shutdown (init 0 / halt).  After rc0.d unmounts filesystems the
+     * kernel jumps directly to the PROM halt call without notifying PCI
+     * or SCSI drivers.  This means there is no opportunity to issue a
+     * Flush command before power is removed.
+     *
+     * With the write cache enabled (the factory default), the controller
+     * acknowledges Write commands as soon as data lands in its DRAM
+     * cache.  If power is cut before the drive's internal GC/flush writes
+     * that DRAM data to NAND, any filesystem metadata written during
+     * unmount (superblock, journal tail, inode table) is silently lost,
+     * producing the observed filesystem corruption.
+     *
+     * With WCE = 0 the controller may only return a Write completion
+     * after the data has been committed to non-volatile NAND storage.
+     * This is equivalent to every write being FUA (Force Unit Access).
+     * Power can now be removed at any point without losing acknowledged
+     * write data.
+     *
+     * The setting is not saved to the controller's non-volatile store
+     * (SVE bit not set in CDW10), so it applies only for this power
+     * cycle and resets to the factory default on next power-on.  The
+     * driver re-applies it on every attach.
+     *
+     * Note: soft->features[NVME_FEAT_VOLATILE_WRITE_CACHE] is non-zero
+     * only when the drive actually has a write cache AND permits the
+     * host to toggle it (Get Features SEL=SUPPORTED returned bit 0 set).
+     * Drives without a write cache, or with a fixed-always-on cache,
+     * report 0 here; we warn but continue (such drives typically have
+     * hardware power-loss protection of their own).
+     */
+
+    /* Track current VWC state. NVMe default is enabled; the DISABLE_WC block
+     * below clears this flag when it successfully disables the cache. */
+    soft->vwc_enabled = (soft->features[NVME_FEAT_VOLATILE_WRITE_CACHE] ? 1 : 0);
+
+#if defined(NVME_DISABLE_WRITE_CACHE) && defined(IP32) && defined(NVME_BUILTIN)
+    if (soft->features[NVME_FEAT_VOLATILE_WRITE_CACHE]) {
+        if (nvme_admin_set_features(soft, NVME_FEAT_VOLATILE_WRITE_CACHE, 0)) {
+            nvme_wait_for_queue_idle(soft, &soft->admin_queue, 5000);
+            soft->vwc_enabled = 0;
+            cmn_err(CE_NOTE, "nvme: volatile write cache DISABLED — "
+                    "writes are now synchronous with NAND (safe for power-off)");
+        } else {
+            cmn_err(CE_WARN, "nvme: Set Features(VWC=0) failed — "
+                    "filesystem corruption on unclean power-off remains possible");
+        }
+    } else {
+        cmn_err(CE_WARN, "nvme: volatile write cache not host-controllable "
+                "(features[VWC]=0x%x) — drive may have fixed cache or built-in PLP",
+                soft->features[NVME_FEAT_VOLATILE_WRITE_CACHE]);
+    }
+#endif /* NVME_DISABLE_WRITE_CACHE */
+
+#if defined(NVME_FUA_WRITES) && defined(IP32) && defined(NVME_BUILTIN)
+    soft->fua_enabled = 1;
+    cmn_err(CE_NOTE, "nvme: FUA mode active — Force Unit Access bit set on all "
+            "Write commands, writes committed to NAND before completion");
+#endif /* NVME_FUA_WRITES */
+
     /* Configure interrupt coalescing if supported
      * Coalesce after 10 completions OR 500 microseconds (whichever comes first)
      * Time calculation: 10 × 4KB reads over 33MHz PCI ≈ 400us, use 500us for margin
@@ -1233,14 +1965,13 @@ nvme_initialize(nvme_soft_t *soft)
 #ifndef NVME_COMPLETION_MANUAL
             nvme_wait_for_queue_idle(soft, &soft->admin_queue, 5000);
 #endif
+#ifdef NVME_ATTACH_VERBOSE
             cmn_err(CE_NOTE, "nvme: Interrupt coalescing configured (10 completions, 500us)");
+#endif
         } else {
             cmn_err(CE_WARN, "nvme: Failed to configure interrupt coalescing");
         }
     }
-
-    /* Start timeout watchdog for checking hung commands */
-    nvme_timeout_watchdog_start(soft);
 
     soft->initialized = 1;
 #ifdef NVME_DBG
@@ -1359,96 +2090,146 @@ nvme_wait_for_queue_idle(nvme_soft_t *soft, nvme_queue_t *q, uint_t timeout_ms)
  * nvme_shutdown: Shutdown NVMe controller cleanly
  */
 static int
-nvme_shutdown(nvme_soft_t *soft)
+nvme_shutdown_ex(nvme_soft_t *soft, int fast_alias)
 {
     uint_t cc, csts;
     int timeout;
-    ushort_t command;
+    uint_t io_wait_ms;
+    uint_t admin_wait_ms;
+    uint_t disable_wait_ms;
+    uint_t cap_to_ms;
 
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme: shutting down controller");
-#endif
+    cmn_err(CE_NOTE, "nvme: shutdown started — adapter %d [%.40s / SN %.20s]%s",
+            soft->adap, (char *)soft->model, (char *)soft->serial,
+            fast_alias ? " (fast alias path)" : "");
 
     /* Stop timeout watchdog - no more commands should time out */
     nvme_timeout_watchdog_stop(soft);
 
-    /* Wait for any in-flight I/O commands to complete (5 second timeout) */
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme: waiting for I/O queue to drain");
-#endif
-    nvme_wait_for_queue_idle(soft, &soft->io_queue, 5000);
+    io_wait_ms = fast_alias ? 100 : 5000;
+    admin_wait_ms = fast_alias ? 100 : 5000;
+    disable_wait_ms = fast_alias ? 250 : 5000;
+
+    /* Wait for any in-flight I/O commands to complete */
+    cmn_err(CE_NOTE, "nvme: draining I/O queue (outstanding: %d, timeout: %ums)",
+            atomicAddInt((int *)&soft->io_queue.outstanding, 0), io_wait_ms);
+
+    if (nvme_wait_for_queue_idle(soft, &soft->io_queue, io_wait_ms) == 0) {
+        cmn_err(CE_NOTE, "nvme: I/O queue drained");
+    } else {
+        cmn_err(CE_WARN, "nvme: I/O queue drain timed out (%d commands still outstanding)",
+                atomicAddInt((int *)&soft->io_queue.outstanding, 0));
+    }
 
     /* Stop completion watchdog timers */
     nvme_watchdog_stop(&soft->io_queue);
     nvme_watchdog_stop(&soft->admin_queue);
 
-    /*
-     * Delete I/O queues using admin commands (must happen BEFORE disabling controller)
-     * This is the proper NVMe shutdown sequence:
-     * 1. Delete I/O Submission Queue
-     * 2. Wait for completion
-     * 3. Delete I/O Completion Queue
-     * 4. Wait for completion
-     */
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme: deleting I/O submission queue");
-#endif
-    if (nvme_admin_delete_sq(soft, soft->io_queue.qid)) {
-        nvme_wait_for_queue_idle(soft, &soft->admin_queue, 5000);
-#ifdef NVME_DBG
-        cmn_err(CE_NOTE, "nvme: I/O submission queue deleted");
-#endif
-    } else {
-        cmn_err(CE_WARN, "nvme: failed to delete I/O submission queue");
-    }
-
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme: deleting I/O completion queue");
-#endif
-    if (nvme_admin_delete_cq(soft, soft->io_queue.qid)) {
-        nvme_wait_for_queue_idle(soft, &soft->admin_queue, 5000);
-#ifdef NVME_DBG
-        cmn_err(CE_NOTE, "nvme: I/O completion queue deleted");
-#endif
-    } else {
-        cmn_err(CE_WARN, "nvme: failed to delete I/O completion queue");
-    }
-
-    /* Request clean shutdown via CC register */
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme: requesting controller shutdown");
-#endif
-    cc = NVME_RD(soft, NVME_REG_CC);
-    cc &= ~NVME_CC_SHN_MASK;
-    cc |= NVME_CC_SHN_NORMAL;
-    NVME_WR(soft, NVME_REG_CC, cc);
-
-    /* Wait for shutdown to complete (1 second timeout) */
-    timeout = 1000;
-    while (timeout > 0) {
-        csts = NVME_RD(soft, NVME_REG_CSTS);
-        if ((csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_COMPLETE) {
-            break;
+    if (!fast_alias) {
+        /*
+         * Issue a Flush command before deleting the I/O queues.
+         *
+         * This forces the NVMe controller to commit all data from its
+         * volatile write-back cache to non-volatile media (NAND flash)
+         * while the I/O queue is still intact and operational.  Without
+         * this step, any write data acknowledged to the host but not yet
+         * persisted in NAND can be lost when power is removed, resulting
+         * in filesystem corruption.
+         *
+         * We poll for completion rather than relying on interrupts because
+         * this path may be reached with interrupts already masked.
+         */
+        cmn_err(CE_NOTE, "nvme: issuing Flush to commit volatile write cache to NAND");
+        if (nvme_cmd_special_flush(soft) == 0) {
+            if (nvme_wait_for_queue_idle(soft, &soft->io_queue, io_wait_ms) == 0) {
+                cmn_err(CE_NOTE, "nvme: Flush complete");
+            } else {
+                cmn_err(CE_WARN, "nvme: Flush timed out — write cache may not be fully committed");
+            }
+        } else {
+            cmn_err(CE_WARN, "nvme: Flush submission failed, proceeding anyway");
         }
-        us_delay(1000);
-        timeout--;
-    }
 
-#ifdef NVME_DBG
-    if (timeout == 0) {
-        cmn_err(CE_WARN, "nvme: shutdown timeout, forcing disable");
-    } else {
-        cmn_err(CE_NOTE, "nvme: shutdown complete");
+        /*
+         * Delete I/O queues using admin commands (must happen BEFORE disabling controller)
+         * This is the proper NVMe shutdown sequence:
+         * 1. Delete I/O Submission Queue
+         * 2. Wait for completion
+         * 3. Delete I/O Completion Queue
+         * 4. Wait for completion
+         */
+        cmn_err(CE_NOTE, "nvme: deleting I/O submission queue (qid %d)", soft->io_queue.qid);
+        if (nvme_admin_delete_sq(soft, soft->io_queue.qid)) {
+            nvme_wait_for_queue_idle(soft, &soft->admin_queue, admin_wait_ms);
+            cmn_err(CE_NOTE, "nvme: I/O submission queue deleted");
+        } else {
+            cmn_err(CE_WARN, "nvme: failed to delete I/O submission queue");
+        }
+
+        cmn_err(CE_NOTE, "nvme: deleting I/O completion queue (qid %d)", soft->io_queue.qid);
+        if (nvme_admin_delete_cq(soft, soft->io_queue.qid)) {
+            nvme_wait_for_queue_idle(soft, &soft->admin_queue, admin_wait_ms);
+            cmn_err(CE_NOTE, "nvme: I/O completion queue deleted");
+        } else {
+            cmn_err(CE_WARN, "nvme: failed to delete I/O completion queue");
+        }
+
+        /*
+         * Wait for shutdown to complete using the controller's own declared
+         * timeout (CAP.TO, bits [31:24], in units of 500ms).  The previous
+         * hardcoded 1-second limit was too short for drives that need up to
+         * several seconds to flush their DRAM write cache to NAND flash;
+         * timing out early caused the controller to be forcibly disabled
+         * before the flush completed, losing data identical to a surprise
+         * power-loss event.  Use a minimum of 5 seconds regardless of CAP.TO.
+         */
+        cap_to_ms = (uint_t)((soft->cap >> 24) & 0xFF) * 500;
+        if (cap_to_ms < 5000)
+            cap_to_ms = 5000;
+
+        cmn_err(CE_NOTE, "nvme: setting CC.SHN=Normal, waiting up to %ums for CSTS.SHST=Complete"
+                " (CAP.TO=%u × 500ms)",
+                cap_to_ms, (uint_t)((soft->cap >> 24) & 0xFF));
+
+        /* Request clean shutdown via CC register */
+        cc = NVME_RD(soft, NVME_REG_CC);
+        cc &= ~NVME_CC_SHN_MASK;
+        cc |= NVME_CC_SHN_NORMAL;
+        NVME_WR(soft, NVME_REG_CC, cc);
+
+        timeout = (int)cap_to_ms;  /* 1 iteration = 1ms via us_delay(1000) */
+        while (timeout > 0) {
+            csts = NVME_RD(soft, NVME_REG_CSTS);
+            if ((csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_COMPLETE) {
+                break;
+            }
+            us_delay(1000);
+            timeout--;
+        }
+
+        if (timeout == 0) {
+            cmn_err(CE_WARN, "nvme: CSTS.SHST=Complete not seen after %ums — "
+                    "forcing disable (CSTS=0x%x)", cap_to_ms,
+                    NVME_RD(soft, NVME_REG_CSTS));
+        } else {
+            cmn_err(CE_NOTE, "nvme: shutdown complete in %ums (CSTS=0x%x)",
+                    cap_to_ms - (uint_t)timeout,
+                    NVME_RD(soft, NVME_REG_CSTS));
+        }
     }
-#endif
 
     /* Disable controller */
+    cmn_err(CE_NOTE, "nvme: disabling controller (CC.EN=0)");
     cc = NVME_RD(soft, NVME_REG_CC);
     cc &= ~NVME_CC_ENABLE;
     NVME_WR(soft, NVME_REG_CC, cc);
 
     /* Wait for controller to become not ready */
-    nvme_wait_for_ready(soft, 0, 5000);
+    if (nvme_wait_for_ready(soft, 0, disable_wait_ms) == 0) {
+        cmn_err(CE_NOTE, "nvme: controller disabled (CSTS.RDY=0)");
+    } else {
+        cmn_err(CE_WARN, "nvme: controller did not clear RDY within %ums", disable_wait_ms);
+    }
 
     /* Free utility buffer */
     if (soft->utility_buffer) {
@@ -1498,6 +2279,12 @@ nvme_shutdown(nvme_soft_t *soft)
     mutex_destroy(&soft->admin_queue.lock);
 
     return 0;
+}
+
+static int
+nvme_shutdown(nvme_soft_t *soft)
+{
+    return nvme_shutdown_ex(soft, 0);
 }
 
 /*
@@ -1680,9 +2467,16 @@ nvme_attach(vertex_hdl_t conn)
     ushort_t            command;
     pciio_info_t        pciioinfo;
     size_t              bar0_size;
-    int                 rc;
     graph_error_t       rv;
+#if defined(IP32)
+    char                serial_key[21];
+    int                 current_slot;
+#endif
 
+#if defined(IP32)
+    serial_key[0] = '\0';
+    current_slot = -1;
+#endif
     if (!conn) {
         cmn_err(CE_WARN, "nvme_attach: PCI device #%d conn is 0");    
         return -1;
@@ -1751,6 +2545,26 @@ nvme_attach(vertex_hdl_t conn)
     /* This is an NVMe device! */
     cmn_err(CE_NOTE, "nvme_attach: found NVMe device %04x:%04x (class %06x) at conn 0x%x",
             vendor_id, device_id, class_code, conn);
+
+#if defined(IP32)
+    /*
+     * Finalize pass fast-path: if we have a pre-initialized soft state saved
+     * from the discovery phase for this exact conn, skip the expensive
+     * nvme_sanitize() + nvme_initialize() (feature queries, queue setup, etc.)
+     * and jump directly to SCSI registration.  This makes the finalize pass
+     * complete in milliseconds instead of ~1.5s per controller, allowing the
+     * drives to be ready before IRIX's rootfs lookup.
+     */
+    if (nvme_ip32_finalize_active && nvme_ip32_finalize_conn == conn &&
+        nvme_ip32_finalize_soft != NULL) {
+        soft = (nvme_soft_t *)nvme_ip32_finalize_soft;
+        nvme_ip32_finalize_soft = NULL;
+        bar0_map = soft->bar0_map;
+        nvme_ip32_build_serial_key(soft->serial, serial_key, sizeof(serial_key));
+        current_slot = pciio_info_slot_get(pciioinfo);
+        goto nvme_attach_post_init;
+    }
+#endif
 
 #ifdef NVME_DBG
     /* Dump the bridge configuration of the parent (if it's a bridge) to understand topology */
@@ -1842,7 +2656,9 @@ nvme_attach(vertex_hdl_t conn)
     pciio_config_set(conn, PCI_CFG_COMMAND, 2, command);
     bar0_size = pciio_info_bar_size_get(pciioinfo, 0);
     if (!bar0_size) {
+#ifdef NVME_ATTACH_VERBOSE
         cmn_err(CE_WARN, "nvme_attach: irix reported bar0 size is 0, overring");
+#endif
         bar0_size = NVME_BAR0_SIZE;
     }
 
@@ -1912,6 +2728,69 @@ nvme_attach(vertex_hdl_t conn)
         DEL(soft);
         return -1;
     }
+
+#if defined(IP32)
+    nvme_ip32_build_serial_key(soft->serial, serial_key, sizeof(serial_key));
+    current_slot = pciio_info_slot_get(pciioinfo);
+
+    /*
+     * IP32 two-phase attach:
+     *  1) Discovery phase (normal enumeration): stage latest conn per serial and
+     *     release controller state immediately (no SCSI graph churn here).
+     *  2) Finalize phase (worker thread): re-enter nvme_attach() with
+     *     nvme_ip32_finalize_active=1 and perform normal attach once per serial.
+     */
+    if (!(nvme_ip32_finalize_active && nvme_ip32_finalize_conn == conn)) {
+        if (!nvme_ip32_finalize_thread_running) {
+            nvme_ip32_start_finalize_thread();
+        }
+
+        if (serial_key[0] == '\0') {
+            cmn_err(CE_WARN, "nvme_attach: unable to derive IP32 serial key for conn 0x%x", conn);
+            nvme_ip32_cleanup_staged_soft(soft);
+            return -1;
+        }
+
+        /*
+         * Save the pre-initialized soft in the candidate table instead of
+         * destroying it.  The finalize pass will consume it to skip the costly
+         * nvme_sanitize() + nvme_initialize() on the good conn, allowing SCSI
+         * registration to complete before IRIX's rootfs lookup fires.
+         * If staging fails, fall through to cleanup below.
+         */
+        if (nvme_ip32_candidate_set_latest(serial_key, conn, current_slot, soft) != 0) {
+            nvme_ip32_cleanup_staged_soft(soft);
+            return -1;
+        }
+
+        cmn_err(CE_NOTE,
+                "nvme_attach: IP32 staged candidate SN=%s at conn 0x%x (slot %d)",
+                serial_key, (uint_t)conn, current_slot);
+
+        /*
+         * Synchronously finalize on the calling thread so the controller is
+         * visible to the SCSI layer before this nvme_attach() returns.
+         *
+         * On the first appearance of a serial: registers the controller.
+         * On subsequent appearances (aliases): swaps the soft state to use
+         * the latest conn's hardware without re-registering in the SCSI layer.
+         *
+         * By doing this synchronously we guarantee the drive is in the hwgraph
+         * before IRIX's rootfs lookup fires, even on a single-CPU IP32 where
+         * the background finalize thread cannot preempt the main boot thread.
+         */
+        nvme_ip32_finalize_candidates();
+
+        /* Also wake the background thread as a fallback (it will find no
+         * candidates since the sync pass already consumed them). */
+        if (nvme_ip32_finalize_thread_running) {
+            vsema(&nvme_ip32_finalize_sema);
+        }
+
+        /* soft is now owned by the candidate table (or was consumed above) */
+        return -1;
+    }
+#endif
 /*
     unsigned char sl = ((unsigned char *)pciioinfo)[13];
     ((unsigned char *)pciioinfo)[13] = 3;
@@ -1922,6 +2801,14 @@ nvme_attach(vertex_hdl_t conn)
         after dumping the struct in 6.5.22 the slot is at byte 13
         we want to set 3 to match expansion slot
 */
+nvme_attach_post_init:
+    /*
+     * Start timeout watchdog only for controllers that will actually attach.
+     * On IP32 staged-candidate probes, nvme_attach returns above and the soft
+     * state is owned by the candidate table; arming the watchdog there can race.
+     */
+    nvme_timeout_watchdog_start(soft);
+
     /* Initialize quiesce state - not quiesced by default */
     soft->quiesce_state = NO_QUIESCE_IN_PROGRESS;
 
@@ -1967,14 +2854,41 @@ nvme_attach(vertex_hdl_t conn)
            FIXME - let ioconfig do it for us and use ioctl when we are a module?
         */
         soft->adap = nvme_get_next_adapter_num();
-#if defined(IP30) && defined(NVME_BUILTIN)
-        // workaround for early boot, give first 2 slots to ql
+#if (defined(IP30) || defined(IP32)) && defined(NVME_BUILTIN)
+        // workaround for early boot, give first 2 slots to ql/Adaptec
         if (soft->adap == 0) {
             soft->adap = 2;
         }
 #endif        
 
         cmn_err(CE_NOTE, "nvme_attach: PCI slot=%d, assigned adapter=%d", slot, soft->adap);
+
+        /* Register in global table for character device ioctl */
+        if (soft->adap < NVME_MAX_CTLR)
+            nvme_ctlr_softmap[soft->adap] = soft;
+
+        /* Create character control device /hw/nvme/ctrl<N> via hwgraph.
+         * The minor device number equals the adapter number, so nvme_ioctl()
+         * can look up the right soft state via getminor(dev). */
+        {
+            vertex_hdl_t nvme_root = GRAPH_VERTEX_NONE;
+            char ctrl_path[32];
+
+            hwgraph_path_add(hwgraph_root, "nvme", &nvme_root);
+            if (nvme_root != GRAPH_VERTEX_NONE) {
+                sprintf(ctrl_path, "ctrl%d", soft->adap);
+                if (hwgraph_char_device_add(nvme_root, ctrl_path,
+                                            "nvme_", &soft->ctrl_vhdl) == GRAPH_SUCCESS) {
+                    device_info_set(soft->ctrl_vhdl, soft);
+                    cmn_err(CE_NOTE, "nvme: created control device /hw/nvme/%s "
+                            "(minor %d)", ctrl_path, soft->adap);
+                } else {
+                    soft->ctrl_vhdl = GRAPH_VERTEX_NONE;
+                    cmn_err(CE_WARN, "nvme: failed to create /hw/nvme/%s "
+                            "— ioctl unavailable", ctrl_path);
+                }
+            }
+        }
 
         /* Create SCSI controller vertex under the PCI connection */
         sprintf(loc_str, "%s/%d", EDGE_LBL_SCSI_CTLR, SCSI_EXT_CTLR(soft->adap));
@@ -2063,7 +2977,7 @@ nvme_attach(vertex_hdl_t conn)
 
                 hwgraph_link_add(path_relative, src_name, edge_name);
 
-#if defined(IP30) && defined(NVME_BUILTIN)
+#if (defined(IP30) || defined(IP32)) && defined(NVME_BUILTIN)
                 /*
                  * Create link from /hw/ql/<N> to ctlr_vhdl (similar to ql driver)
                  * This makes the device findable for root device discovery
@@ -2171,6 +3085,15 @@ nvme_attach(vertex_hdl_t conn)
     cmn_err(CE_NOTE, "nvme_attach: registered PCI error handler");
 #endif
 
+#if defined(IP32)
+    if (serial_key[0] != '\0') {
+        if (current_slot < 0) {
+            current_slot = pciio_info_slot_get(pciioinfo);
+        }
+        nvme_ip32_alias_set_conn(serial_key, conn, soft, current_slot);
+    }
+#endif
+
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme_attach: successfully attached NVMe device");
 #endif
@@ -2205,6 +3128,105 @@ nvme_remove_disk_aliases(char *disk_label, uint_t adap, uint_t targ)
 }
 
 /*
+ * nvme_detach_attached_soft: detach an already-attached controller by soft state.
+ * This path is used both by regular detach and IP32 alias replacement.
+ */
+static int
+nvme_detach_attached_soft(nvme_soft_t *soft, vertex_hdl_t conn, int fast_alias)
+{
+    vertex_hdl_t ctlr_vhdl;
+    uint_t targ = 0;
+    uint_t lun = 0;
+
+    if (!soft) {
+        return -1;
+    }
+
+    cmn_err(CE_NOTE, "nvme: detach initiated — adapter %d [%.40s / SN %.20s]%s",
+            soft->adap, (char *)soft->model, (char *)soft->serial,
+            fast_alias ? " (fast alias)" : "");
+
+    ctlr_vhdl = soft->scsi_vhdl;
+
+#if defined(IP32)
+    {
+        char serial_key[21];
+        nvme_ip32_build_serial_key(soft->serial, serial_key, sizeof(serial_key));
+        if (serial_key[0] != '\0') {
+            nvme_ip32_alias_clear_conn(serial_key, conn);
+        }
+    }
+#endif
+
+    /* Remove inventory entries BEFORE removing vertices */
+    if (ctlr_vhdl != GRAPH_VERTEX_NONE) {
+        vertex_hdl_t lun_vhdl = scsi_lun_vhdl_get(ctlr_vhdl, targ, lun);
+        if (lun_vhdl != GRAPH_VERTEX_NONE) {
+            /* Remove disk inventory (-1 matches any value) */
+            hwgraph_inventory_remove(lun_vhdl, -1, -1, -1, -1, -1);
+        }
+        /* Remove controller inventory (-1 matches any value) */
+        hwgraph_inventory_remove(ctlr_vhdl, -1, -1, -1, -1, -1);
+    }
+
+    if (ctlr_vhdl != GRAPH_VERTEX_NONE) {
+        /* Remove SCSI device (LUN and target vertices) */
+        scsi_device_remove(ctlr_vhdl, targ, lun);
+
+        /* Remove /hw/scsi_ctlr/%d link */
+        {
+            vertex_hdl_t scsi_ctlr_vhdl;
+            char edge_name[5];
+            sprintf(edge_name, "%d", SCSI_EXT_CTLR(soft->adap));
+            if (hwgraph_traverse(hwgraph_root, EDGE_LBL_SCSI_CTLR, &scsi_ctlr_vhdl) == GRAPH_SUCCESS) {
+                hwgraph_edge_remove(scsi_ctlr_vhdl, edge_name, NULL);
+            }
+        }
+
+        /* Remove /hw/.../pci/.../scsi edge for this connection */
+        hwgraph_edge_remove(conn, EDGE_LBL_SCSI, NULL);
+    }
+
+    /* Remove disk device aliases (dks entries in /hw/disk and /hw/rdisk) */
+    nvme_remove_disk_aliases(EDGE_LBL_DISK, soft->adap, targ);
+    nvme_remove_disk_aliases(EDGE_LBL_RDISK, soft->adap, targ);
+
+#ifdef NVME_COMPLETION_INTERRUPT
+    /* Disable interrupts */
+    nvme_disable_interrupts(soft);
+#endif
+#ifdef NVME_COMPLETION_THREAD
+    /* Stop completion processing thread */
+    nvme_stop_poll_thread(soft);
+#endif
+
+    /* Shutdown controller and free resources */
+    nvme_shutdown_ex(soft, fast_alias);
+
+    if (soft->bar0_map)
+        pciio_piomap_free(soft->bar0_map);
+
+    /* Destroy SCSI controller vertex */
+    if (ctlr_vhdl != GRAPH_VERTEX_NONE) {
+        hwgraph_vertex_destroy(ctlr_vhdl);
+    }
+
+    /* Remove control device and clear global table entry */
+    if (soft->adap < NVME_MAX_CTLR)
+        nvme_ctlr_softmap[soft->adap] = NULL;
+    if (soft->ctrl_vhdl != GRAPH_VERTEX_NONE) {
+        hwgraph_vertex_destroy(soft->ctrl_vhdl);
+        soft->ctrl_vhdl = GRAPH_VERTEX_NONE;
+    }
+
+    DEL(soft);
+
+    cmn_err(CE_NOTE, "nvme: detach complete");
+
+    return 0;
+}
+
+/*
  * nvme_detach: called when device is being removed
  */
 int
@@ -2212,8 +3234,6 @@ nvme_detach(vertex_hdl_t conn)
 {
     nvme_soft_t        *soft;
     vertex_hdl_t        ctlr_vhdl;
-    uint_t              targ = 0;
-    uint_t              lun = 0;
     uint_t              class_code;
     pciio_info_t        pciioinfo;
 
@@ -2246,80 +3266,23 @@ nvme_detach(vertex_hdl_t conn)
 
     /* Get SCSI controller vertex from the "scsi" edge on the PCI connection */
     if (hwgraph_edge_get(conn, EDGE_LBL_SCSI, &ctlr_vhdl) != GRAPH_SUCCESS) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_detach: unable to find SCSI controller vertex");
-#endif
         return -1;
     }
 
     {
         scsi_ctlr_info_t *ctlr_info = scsi_ctlr_info_get(ctlr_vhdl);
         if (!ctlr_info) {
-#ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_detach: unable to get controller info");
-#endif
             hwgraph_vertex_unref(ctlr_vhdl);
             return -1;
         }
         soft = SCI_INFO(ctlr_info);
         if (!soft) {
-#ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_detach: no soft state in SCI_INFO");
-#endif
             hwgraph_vertex_unref(ctlr_vhdl);
             return -1;
         }
     }
 
-    /* Remove inventory entries BEFORE removing vertices */
-    {
-        vertex_hdl_t lun_vhdl = scsi_lun_vhdl_get(ctlr_vhdl, targ, lun);
-        if (lun_vhdl != GRAPH_VERTEX_NONE) {
-            /* Remove disk inventory (-1 matches any value) */
-            hwgraph_inventory_remove(lun_vhdl, -1, -1, -1, -1, -1);
-        }
-        /* Remove controller inventory (-1 matches any value) */
-        hwgraph_inventory_remove(ctlr_vhdl, -1, -1, -1, -1, -1);
-    }
-
-    /* Remove SCSI device (LUN and target vertices) */
-    scsi_device_remove(ctlr_vhdl, targ, lun);
-
-    /* Remove /hw/scsi_ctlr/%d link */
-    {
-        vertex_hdl_t scsi_ctlr_vhdl;
-        char edge_name[5];
-        sprintf(edge_name, "%d", SCSI_EXT_CTLR(soft->adap));
-        if (hwgraph_traverse(hwgraph_root, EDGE_LBL_SCSI_CTLR, &scsi_ctlr_vhdl) == GRAPH_SUCCESS) {
-            hwgraph_edge_remove(scsi_ctlr_vhdl, edge_name, NULL);
-        }
-    }
-
-    /* Remove disk device aliases (dks entries in /hw/disk and /hw/rdisk) */
-    nvme_remove_disk_aliases(EDGE_LBL_DISK, soft->adap, targ);
-    nvme_remove_disk_aliases(EDGE_LBL_RDISK, soft->adap, targ);
-
-#ifdef NVME_COMPLETION_INTERRUPT
-    /* Disable interrupts */
-    nvme_disable_interrupts(soft);
-#endif
-#ifdef NVME_COMPLETION_THREAD
-    /* Stop completion processing thread */
-    nvme_stop_poll_thread(soft);
-#endif
-
-    /* Shutdown controller and free resources */
-    nvme_shutdown(soft);
-
-    if (soft->bar0_map)
-        pciio_piomap_free(soft->bar0_map);
-
-    /* Destroy SCSI controller vertex */
-    hwgraph_vertex_destroy(ctlr_vhdl);
-
-    DEL(soft);
-
-    return 0;
+    return nvme_detach_attached_soft(soft, conn, 0);
 }
 
 
@@ -2580,7 +3543,7 @@ nvme_watchdog_stop(nvme_queue_t *q)
  * nvme_check_timeouts: Check all in-flight commands for timeouts
  *
  * Iterates through all CIDs in the I/O queue and checks if any have exceeded
- * their timeout value (from sr_timeout field in scsi_request_t).
+ * a fixed timeout value (2 seconds).
  *
  * For timed-out commands, issues an NVMe Abort command and updates the
  * start_time to current lbolt to prevent re-aborting on subsequent checks.
@@ -2591,6 +3554,7 @@ void
 nvme_check_timeouts(nvme_soft_t *soft)
 {
     time_t now = lbolt;
+    const time_t timeout_limit = (2 * HZ);
     nvme_queue_t *q = &soft->io_queue;
     int cid, i;
     scsi_request_t *req;
@@ -2658,14 +3622,14 @@ nvme_check_timeouts(nvme_soft_t *soft)
         /* Check if command has timed out */
         elapsed = now - soft->io_requests[cid].start_time;
 
-        if (elapsed > req->sr_timeout) {
+        if (elapsed > timeout_limit) {
             /* Command has timed out */
             cmn_err(CE_WARN,
-                    "nvme: CID %d timeout after %d seconds (limit %d seconds)",
-                    cid, (int)(elapsed / HZ), (int)(req->sr_timeout / HZ));
-            cmn_err(CE_WARN,
-                    "nvme: CID %d timeout after %d seconds (limit %d seconds)",
-                    cid, (int)(elapsed / HZ), (int)(req->sr_timeout / HZ));
+                    "nvme: ctlr=%d conn=0x%x SN=%.*s CID %d timeout after %d seconds (limit %d seconds)",
+                    soft->adap,
+                    (uint_t)soft->pci_vhdl,
+                    20, soft->serial,
+                    cid, (int)(elapsed / HZ), (int)(timeout_limit / HZ));
 
             /* Store in aborted FIFO for retry detection */
             nvme_aborted_fifo_add(soft, req);
@@ -2821,21 +3785,101 @@ nvme_unloadme(vertex_hdl_t conn)
  */
 
 /*
- * nvme_open: Dummy character device open
+ * nvme_soft_from_dev: Retrieve soft state from a hwgraph character device dev_t.
+ *
+ * hwgraph_char_device_add() encodes the vertex handle in the dev_t minor field.
+ * dev_to_vhdl() decodes it back; device_info_get() retrieves the soft pointer
+ * we stored via device_info_set() at attach time.
+ */
+static nvme_soft_t *
+nvme_soft_from_dev(dev_t dev)
+{
+    vertex_hdl_t vhdl = dev_to_vhdl(dev);
+    if (vhdl == GRAPH_VERTEX_NONE)
+        return NULL;
+    return (nvme_soft_t *)device_info_get(vhdl);
+}
+
+/*
+ * nvme_open: Character device open for /hw/nvme/ctrl<N>
  */
 int
 nvme_open(dev_t *devp, int flag, int otyp, struct cred *crp)
 {
-    cmn_err(CE_NOTE, "nvme_open: called (unused - use SCSI layer)");
+    nvme_soft_t *soft = nvme_soft_from_dev(*devp);
+    if (!soft || !soft->initialized)
+        return ENXIO;
     return 0;
 }
 
 /*
- * nvme_close: Dummy character device close
+ * nvme_close: Character device close for /hw/nvme/ctrl<N>
  */
 int
 nvme_close(dev_t dev, int flag, int otyp, struct cred *crp)
 {
-    cmn_err(CE_NOTE, "nvme_close: called (unused - use SCSI layer)");
     return 0;
+}
+
+/*
+ * nvme_ioctl: Runtime control of NVMe controller features.
+ *
+ * Commands:
+ *   NVME_IOC_GET_VWC  -- copy int (0=disabled, 1=enabled) to *arg
+ *   NVME_IOC_SET_VWC  -- read int from *arg; 0=disable, non-zero=enable
+ *
+ * Device node: /hw/nvme/ctrl<N>  (minor number = hwgraph vertex handle)
+ */
+int
+nvme_ioctl(dev_t dev, int cmd, void *arg, int mode, struct cred *crp, int *rvalp)
+{
+    nvme_soft_t *soft = nvme_soft_from_dev(dev);
+    int val;
+
+    if (!soft || !soft->initialized)
+        return ENXIO;
+
+    switch (cmd) {
+    case NVME_IOC_GET_VWC:
+        val = soft->vwc_enabled;
+        if (copyout(&val, (caddr_t)arg, sizeof(int)))
+            return EFAULT;
+        return 0;
+
+    case NVME_IOC_SET_VWC:
+        if (copyin((caddr_t)arg, &val, sizeof(int)))
+            return EFAULT;
+        if (!soft->features[NVME_FEAT_VOLATILE_WRITE_CACHE]) {
+            cmn_err(CE_WARN, "nvme_ioctl: drive does not support "
+                    "host-controlled write cache (VWC feature absent)");
+            return ENOTSUP;
+        }
+        if (nvme_admin_set_features(soft, NVME_FEAT_VOLATILE_WRITE_CACHE,
+                                    val ? 1 : 0)) {
+            nvme_wait_for_queue_idle(soft, &soft->admin_queue, 5000);
+            soft->vwc_enabled = val ? 1 : 0;
+            cmn_err(CE_NOTE, "nvme_ioctl: adapter %d write cache %s",
+                    soft->adap, soft->vwc_enabled ? "ENABLED" : "DISABLED");
+            return 0;
+        }
+        cmn_err(CE_WARN, "nvme_ioctl: Set Features(VWC=%d) failed", val ? 1 : 0);
+        return EIO;
+
+    case NVME_IOC_GET_FUA:
+        val = soft->fua_enabled;
+        if (copyout(&val, (caddr_t)arg, sizeof(int)))
+            return EFAULT;
+        return 0;
+
+    case NVME_IOC_SET_FUA:
+        if (copyin((caddr_t)arg, &val, sizeof(int)))
+            return EFAULT;
+        soft->fua_enabled = val ? 1 : 0;
+        cmn_err(CE_NOTE, "nvme_ioctl: adapter %d FUA %s",
+                soft->adap, soft->fua_enabled ? "ENABLED" : "DISABLED");
+        return 0;
+
+    default:
+        return EINVAL;
+    }
 }

@@ -11,6 +11,8 @@
 # Supportted values IP32 (O2) IP30 (Octane) IP35 (Fuel, Tezro, Origin 350)
 CPUBOARD=IP30
 BUILTIN=0
+DISABLE_WC=0
+ENABLE_FUA=0
 # Include the IRIX kernel loadable I/O module makefile
 # This provides $(CC), $(LD), $(CFLAGS), $(LDFLAGS), $(ML), etc.
 
@@ -24,7 +26,22 @@ BUILTIN_CFLAGS=-DNVME_MODULE
 
 COMMON_FLAGS=
 COMMON_LDFLAGS=-v
-COMMON_CFLAGS=$(BUILTIN_CFLAGS)
+# DISABLE_WC and FUA are mutually exclusive — DISABLE_WC takes priority.
+# DISABLE_WC=1 : disable volatile write cache globally at init via Set Features.
+# ENABLE_FUA=1 : set Force Unit Access bit on every NVMe Write command.
+# Both achieve the same safety goal (no acknowledged write lost on power-off)
+# via different mechanisms.  Set at most one to 1.
+#if $(DISABLE_WC) == "1" && $(CPUBOARD) == "IP32" && $(BUILTIN) == "1"
+DISABLE_WC_CFLAGS=-DNVME_DISABLE_WRITE_CACHE
+FUA_CFLAGS=
+#elif $(ENABLE_FUA) == "1" && $(CPUBOARD) == "IP32" && $(BUILTIN) == "1"
+DISABLE_WC_CFLAGS=
+FUA_CFLAGS=-DNVME_FUA_WRITES
+#else
+DISABLE_WC_CFLAGS=
+FUA_CFLAGS=
+#endif
+COMMON_CFLAGS=$(BUILTIN_CFLAGS) $(DISABLE_WC_CFLAGS) $(FUA_CFLAGS)
 
 LDFLAGS_IP35=-nostdlib -64 -mips4
 LDFLAGS_IP30=-nostdlib -64 -mips4
@@ -120,6 +137,9 @@ ioc:
 nt:
 	cc nvmetest.c -o nt
 
+nvmectl:
+	cc nvmectl.c -o nvmectl
+
 dp:
 	diskperf -D -W -c100m -r4k -m4m /nvme/lol
 
@@ -154,4 +174,4 @@ help:
 	@echo "  ml unld -p nvme_        # Unload by prefix"
 	@echo "  ml list                 # List modules"
 
-.PHONY: all load unload reload list clean install help reboot ioc nt dp
+.PHONY: all load unload reload list clean install help reboot ioc nt nvmectl dp

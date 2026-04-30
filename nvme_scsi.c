@@ -975,14 +975,50 @@ nvme_scsi_info(vertex_hdl_t lun_vhdl)
 }
 
 /*
- * nvme_scsi_dump: Crash dump support
+ * nvme_scsi_dump: Called by IRIX during system shutdown and crash dumps to
+ * quiesce the SCSI adapter and flush all pending write data to non-volatile
+ * media before power is removed.
+ *
+ * IRIX trusts that after this returns, the drive contains all data that was
+ * previously acknowledged as written.  Returning without flushing leaves the
+ * NVMe controller's volatile write cache uncommitted, which causes filesystem
+ * corruption when the system is subsequently powered off.
  */
 int
 nvme_scsi_dump(vertex_hdl_t ctlr_vhdl)
 {
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme_scsi_dump: dump requested");
-#endif
+    nvme_soft_t *soft;
+    scsi_ctlr_info_t *ctlr_info;
+
+    ctlr_info = scsi_ctlr_info_get(ctlr_vhdl);
+    if (!ctlr_info)
+        return 0;
+    soft = (nvme_soft_t *)SCI_INFO(ctlr_info);
+    if (!soft || !soft->initialized || !soft->bar0)
+        return 0;
+
+    cmn_err(CE_NOTE, "nvme_scsi_dump: shutdown quiesce for adapter %d [%.40s / SN %.20s]",
+            soft->adap, (char *)soft->model, (char *)soft->serial);
+
+    /*
+     * Issue an NVMe Flush command (opcode 0x00) to force the controller to
+     * write all volatile cache data to non-volatile media.  We then poll
+     * for its completion rather than relying on interrupts, which may have
+     * already been quiesced by IRIX at this point in the shutdown sequence.
+     */
+    cmn_err(CE_NOTE, "nvme_scsi_dump: issuing NVMe Flush (outstanding I/O: %d)",
+            atomicAddInt((int *)&soft->io_queue.outstanding, 0));
+
+    if (nvme_cmd_special_flush(soft) == 0) {
+        if (nvme_wait_for_queue_idle(soft, &soft->io_queue, 10000) == 0) {
+            cmn_err(CE_NOTE, "nvme_scsi_dump: flush complete, write cache committed to NAND");
+        } else {
+            cmn_err(CE_WARN, "nvme_scsi_dump: flush timed out — write cache may not be fully committed");
+        }
+    } else {
+        cmn_err(CE_WARN, "nvme_scsi_dump: flush submission failed — write cache not explicitly committed");
+    }
+
     return 0;
 }
 

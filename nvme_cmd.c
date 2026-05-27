@@ -769,6 +769,32 @@ nvme_get_translated_addr(nvme_soft_t *soft, alenlist_t alenlist, size_t maxlengt
 {
     alenaddr_t address;
     size_t length;
+    size_t page_size = soft->nvme_page_size;
+
+    /* Clamp to nvme_page_size — callers may pass chunk_size which can be larger */
+    if (maxlength > page_size)
+        maxlength = page_size;
+
+    /*
+     * On the first fetch, peek at the start VA to find the offset within
+     * the NVMe page and shrink maxlength to cover only the remainder of
+     * that first page.  This matters when nvme_page_size < system page
+     * size (e.g. 4K NVMe on a 16K IRIX system): the alenlist segments are
+     * aligned to the system page size, so without this correction PRP1
+     * would span past the NVMe page boundary.
+     */
+    if (alenlist_cursor_offset(alenlist, NULL) == 0) {
+        alenaddr_t start_va;
+        size_t dummy;
+        if (alenpair_get(alenlist, &start_va, &dummy) == ALENLIST_SUCCESS) {
+            size_t offset = start_va & (page_size - 1);
+            if (offset != 0) {
+                size_t first_page_remain = page_size - offset;
+                if (maxlength > first_page_remain)
+                    maxlength = first_page_remain;
+            }
+        }
+    }
 
     /* Get next entry from alenlist */
     if (alenlist_get(alenlist, NULL, maxlength, &address, &length, 0) != ALENLIST_SUCCESS) {
@@ -1044,7 +1070,6 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
     nvme_command_t *cmd = &(ps->cmd);
     alenaddr_t address;
     size_t length;
-    size_t fetch_size;
     uint_t chunk_size;
 
     /* If no data transfer, we're done */
@@ -1069,8 +1094,7 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 #endif
 
     /* Get and translate the first page (possibly partial) for PRP1 */
-    fetch_size = (chunk_size < soft->nvme_page_size) ? chunk_size : soft->nvme_page_size;
-    if (nvme_get_translated_addr(soft, ps->alenlist, fetch_size, &address, &length, ps->flags) != 0) {
+    if (nvme_get_translated_addr(soft, ps->alenlist, chunk_size, &address, &length, ps->flags) != 0) {
         cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to get/translate first page");
         return 0;  /* Hard error - DMA translation failed */
     }
@@ -1098,8 +1122,7 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
         /*
          * CASE 2: Exactly 2 pages - use PRP2 directly (no PRP list needed)
          */
-        fetch_size = chunk_size;
-        if (nvme_get_translated_addr(soft, ps->alenlist, fetch_size, &address, &length, ps->flags) != 0) {
+        if (nvme_get_translated_addr(soft, ps->alenlist, chunk_size, &address, &length, ps->flags) != 0) {
             cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to get/translate second page");
             return 0;  /* Hard error - DMA translation failed */
         }
@@ -1123,9 +1146,7 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 
         /* Walk the alenlist page by page to fill PRP list */
         while (chunk_size > 0) {
-            /* Get and translate next chunk */
-            fetch_size = (chunk_size < soft->nvme_page_size) ? chunk_size : soft->nvme_page_size;
-            if (nvme_get_translated_addr(soft, ps->alenlist, fetch_size, &address, &length, ps->flags) != 0) {
+            if (nvme_get_translated_addr(soft, ps->alenlist, chunk_size, &address, &length, ps->flags) != 0) {
                 cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to get/translate page (remaining=%u)",
                         chunk_size);
                 return 0;  /* Hard error - DMA translation failed */

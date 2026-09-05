@@ -1,0 +1,1294 @@
+# Design and Safety Review — `irixnvme`, an NVMe Host Adapter Driver for IRIX 6.5
+
+**Subject:** https://github.com/techomancer/irixnvme
+**Revision reviewed:** `88e99f5` — *"fix prp1 size on system with larger page sizes"*, 26 May 2026
+**Target platforms:** IP32 (O2), IP30 (Octane), IP35 (Fuel / Tezro / Origin 350)
+**Review date:** 8 August 2026
+
+---
+
+## Reference documents used in this review
+
+Every normative claim below is tied to one of these. Full bibliography with editions and
+provenance is at the end of the document.
+
+| Short form used in text | Full title | Doc. no. | Download |
+|---|---|---|---|
+| **DDPG** | *IRIX® Device Driver Programmer's Guide* | 007-0911-210 | https://irix7.com/techpubs/007-0911-210.pdf |
+| **O2 DDPG** | *IRIX® 6.3 for O2™ Device Driver Programming Guide* | 007-3443-002 | https://irix7.com/techpubs/007-3443-002.pdf |
+| **DDPG-110** | *IRIX® Device Driver Programmer's Guide* (earlier edition, cross-check) | 007-0911-110 | https://irix7.com/techpubs/007-0911-110.pdf |
+| **DDPG-090** | *IRIX™ Device Driver Programmer's Guide* (earlier edition, cross-check) | 007-0911-090 | http://irix7.com/techpubs/007-0911-090.pdf |
+| **NVMe 1.0e** | *NVM Express™ Specification, Revision 1.0e* | — | https://nvmexpress.org/wp-content/uploads/NVM-Express-1_0e.pdf |
+
+**DDPG (007-0911-210)** is the correct edition to hold this driver to: its Record of Revision
+dates it November 2003, "Incorporates information for the IRIX 6.5.22 release" — the exact
+IRIX version the driver's own README reports being developed against.
+
+**NVMe 1.0e** is the revision the driver's README names as its reference.
+
+---
+
+## 0. Scope, method, and a correction
+
+This review reads the driver against three things: the documented IRIX driver contract, the
+NVMe 1.0e specification, and the behaviour of the SCSI and disk layers the driver plugs into.
+Findings are graded by what actually happens on the three target machines, not by how far they
+stray from an idealised reading of the manual.
+
+The driver never establishes that a DMA transfer has completed before it releases the buffer, 
+never checks whether its DMA translations succeeded, and gets three of the SCSI host-adapter 
+entry-point contracts wrong in ways that break crash dumps, cache-flush semantics, and 
+write ordering. Those are the real findings.
+
+**Confidence marking.** Each finding is tagged *Certain* (verified in the source and against
+the documented contract), *Likely* (mechanism is clear, exact field behaviour depends on
+runtime state), or *Verify on target* (needs a check on real hardware or a real build).
+
+---
+
+## 1. Executive summary
+
+The driver's structure is sound and the SCSI-emulation approach is the right one. Eight things
+are missing from a safe implementation:
+
+1. **No DMA completion guarantee.** Nothing in the driver establishes that inbound DMA has
+   landed in physical memory before the buffer is handed back to the filesystem. By choosing
+   one-step translation, the driver has structurally locked itself out of the only primitives
+   that provide that guarantee.
+2. **No DMA translation failure handling** on the five mappings that matter most — the admin
+   and I/O queues. A failed translation writes bus address 0 into the controller's queue base
+   registers and the controller then DMAs to it.
+3. **The crash-dump entry point always reports failure.** A machine booted from NVMe can never
+   write a panic dump.
+4. **SYNCHRONIZE CACHE completes before the flush does.** The command is reported successful
+   the instant it is queued.
+5. **No write-cache flush path at all in normal operation**, which makes the drive's volatile
+   write cache a standing data-integrity exposure on two of the three target platforms.
+6. **Ordered / head-of-queue tags are not barriers.** The SCSI layer's only write-ordering
+   primitive is silently a no-op.
+7. **A post-DMA cache invalidate is issued against a user virtual address from the interrupt
+   thread**, on the very code path the driver opts itself into.
+8. **No error-recovery ladder.** The abort entry point is a stub, controller fatal status is
+   never polled, and a wedged command wedges the disk permanently.
+
+---
+
+## 2. Findings
+
+### Tier 1 — Will crash, hang, or corrupt
+
+---
+
+#### 1.1 — Five DMA translations used without checking whether they succeeded — *Certain*
+
+**Where:** [`nvmedrv.c:1585`](nvmedrv.c) (admin SQ), [`:1604`](nvmedrv.c) (admin CQ),
+[`:1650`](nvmedrv.c) (I/O SQ), [`:1669`](nvmedrv.c) (I/O CQ), [`:1766`](nvmedrv.c) (utility buffer)
+
+```c
+soft->admin_queue.sq_phys = pciio_dmatrans_addr(soft->pci_vhdl, 0,
+                                                kvtophys(soft->admin_queue.sq),
+                                                queue_size * NVME_SQ_ENTRY_SIZE,
+                                                PCIIO_DMA_CMD | DMATRANS64 | QUEUE_SWAP);
+/* ... no test of sq_phys ... */
+```
+
+The result is stored and used with no test. The PRP pool ([`nvme_cmd.c:1265`](nvme_cmd.c)) and
+the per-page data-path translation ([`nvme_cmd.c:805`](nvme_cmd.c)) *are* checked; these five
+are not.
+
+**Contract.** DDPG, "Mapping a Specific Buffer," p. 750:
+
+> If the mapping cannot be set up, 0 is returned. (You must check for this possibility,
+> because if you start a DMA transfer to location 0, a bus error results.)
+
+and, "Using One-Step DMA Translation," p. 751:
+
+> Some systems also support one-step mapping functions `pciio_dmatrans_addr()` and
+> `pciio_dmatrans_list()`. … They can fail (returning 0) in systems that do not use simple bus
+> maps. If you use them, you must test the returned address. If it is 0, the one-step
+> translation failed and the address is invalid.
+
+**What happens.** `nvme_initialize()` writes `soft->admin_queue.sq_phys` into ASQ and
+`cq_phys` into ACQ, then sets `CC.EN`. If translation returned 0, the controller begins
+fetching Submission Queue entries from PCI bus address 0. On Bridge/XBridge that is a bus
+error; the machine panics during `ml ld` or, for a `BUILTIN=1` kernel, during boot before the
+root filesystem is up.
+
+**When it triggers.** Not on a healthy O2 or Octane, where the direct-mapped window always
+resolves. It triggers on IP35 when the DMA buffer lands outside the bus's 32-bit direct-mapping
+node (see 3.9), and on any system where the one-step path is unavailable. It is also the
+failure mode you get from a subtly wrong `pci_vhdl` — which is the situation the driver's own
+IP32 multi-bridge enumeration code (`nvmedrv.c:324`–`409`, `:2787`) exists to manage.
+
+**Fix.** Test all five. Fail the attach cleanly rather than enabling the controller:
+
+```c
+soft->admin_queue.sq_phys = pciio_dmatrans_addr(...);
+if (!soft->admin_queue.sq_phys) {
+    cmn_err(CE_WARN, "nvme: admin SQ DMA translation failed");
+    goto err_free_admin_sq;
+}
+```
+
+This is a ten-line patch and it removes a boot-time panic. Do it first.
+
+---
+
+#### 1.2 — The crash-dump entry point unconditionally reports failure — *Certain*
+
+**Where:** [`nvme_scsi.c:987`–`1023`](nvme_scsi.c)
+
+```c
+int
+nvme_scsi_dump(vertex_hdl_t ctlr_vhdl)
+{
+    ...
+    if (!ctlr_info)
+        return 0;
+    ...
+    if (!soft || !soft->initialized || !soft->bar0)
+        return 0;
+    ...
+    return 0;         /* <-- the success path returns 0 too */
+}
+```
+
+Every path returns 0.
+
+**Contract.** `SCI_DUMP` is the host adapter's crash-dump entry point. Its return convention is
+success = non-zero, failure = 0. Every other IRIX SCSI host adapter returns non-zero from this
+entry point on success. The disk driver treats a zero return as fatal: on `DUMP_OPEN`,
+`dkscdump()` calls the controller's dump routine and converts a zero return straight into
+`EIO`.
+
+**What happens.** Every attempt to write a panic dump to an NVMe-backed disk fails immediately
+with `EIO`. On a system booted from NVMe — the driver's headline feature — you never get a
+crash dump, which is precisely when you most need one, since the driver is new and the machine
+is crashing.
+
+**Second, independent problem on the same function.** The entry point is also doing the wrong
+job. `SCI_DUMP` is invoked at panic time, at `spl7`, with interrupts disabled, and its
+contract is to put the adapter into a state where subsequent `scsi_command()` calls can write
+dump blocks by polling. This implementation instead issues a Flush and waits, on the theory —
+stated in its own header comment — that it is a "shutdown quiesce … before power is removed."
+That is a different hook. The good news is that `nvme_wait_for_queue_idle()`
+([`nvmedrv.c:2038`](nvmedrv.c)) polls the completion queue itself rather than waiting on the
+interrupt thread, so the driver's I/O path *would* work with interrupts off — the machinery is
+there, it just isn't wired to the right contract.
+
+**Fix.**
+
+```c
+    /* success */
+    return 1;
+```
+
+and add an explicit dump-mode flag that forces `nvme_scsi_command()` down a polled-completion
+path for the duration, rather than relying on the watchdog to notice missed interrupts. Keep
+the Flush — it is harmless and useful — but stop treating this entry point as a shutdown hook.
+
+A related detail: `nvme_wait_for_queue_idle(soft, &soft->io_queue, 10000)` waits for *every*
+outstanding command on the I/O queue, not just the Flush. At panic time other commands may
+never complete, so the common case is a 10-second stall followed by a spurious
+"flush timed out" warning. Wait on the Flush's own completion instead.
+
+---
+
+#### 1.3 — SYNCHRONIZE CACHE is reported complete before the flush has happened — *Certain*
+
+**Where:** [`nvme_scsi.c:870`–`888`](nvme_scsi.c) and [`nvme_scsi.c:456`–`494`](nvme_scsi.c)
+
+```c
+    case SCSIOP_SYNC_CACHE:
+        rc = nvme_scsi_sync_cache(soft, req);
+        break;
+    ...
+done:
+    if (req->sr_notify) {
+        req->sr_ha = NULL;
+        (*req->sr_notify)(req);
+    }
+```
+
+`nvme_scsi_sync_cache()` allocates a CID, builds an NVMe Flush, submits it **asynchronously**,
+and returns 0. Control then falls out of the `switch` via `break` into `done:`, which notifies
+the upper layer immediately.
+
+Contrast the READ/WRITE cases a few lines above, which `return` rather than `break`
+specifically to avoid this:
+
+```c
+    case SCSIOP_READ_6: ...
+        nvme_scsi_read_write(soft, req);
+        return; // notify always called by nvme_scsi_read_write
+```
+
+**Two distinct consequences.**
+
+*First, the semantic one.* SYNCHRONIZE CACHE exists to answer one question — "is my data on
+stable media yet?" — and this implementation answers "yes" the instant the command is queued.
+Any caller that uses it as a barrier gets no barrier.
+
+*Second, a corrupted reference count.* `nvme_io_cid_alloc()` installs a reference count in
+`req->sr_ha` (`atomicAddInt((int *)&req->sr_ha, commands)`,
+[`nvme_cmd.c:1483`](nvme_cmd.c)). The `done:` label then does `req->sr_ha = NULL`, a
+full-width store that wipes it. When the Flush completes, `nvme_io_cid_done()` decrements from
+zero, wraps to `0xFFFFFFFF`, `last` is false, and `nvme_complete_request()` is not called.
+
+The saving grace is that the wrap is what *prevents* a double completion here. That is luck,
+not design: if `sr_ha` held 1 at that moment for any reason, the request would be notified
+twice, and the second notify would be a `biodone()` on a `buf_t` the filesystem has already
+reclaimed.
+
+**Practical severity today.** IRIX's `dksc` disk driver does not issue SYNCHRONIZE CACHE on its
+normal I/O or shutdown paths, so this is not firing on every unmount. It fires for anything
+that reaches the device through the generic SCSI path. But the fact that `dksc` never sends it
+is itself the subject of finding 2.2, and it means this bug has been sitting unexercised
+rather than being safe.
+
+**Fix.** Make SYNC_CACHE take the same shape as READ/WRITE: submit, and `return` without
+notifying; let the completion handler call `nvme_complete_request()`. And stop writing
+`req->sr_ha = NULL` at `done:` for commands that own an outstanding reference count — or,
+better, stop using `sr_ha` as a counter at all (3.1).
+
+---
+
+#### 1.4 — Post-DMA cache invalidate issued against a user virtual address from the interrupt thread — *Certain*
+
+**Where:** [`nvme_cpl.c:60`–`73`](nvme_cpl.c)
+
+```c
+void
+nvme_complete_request(scsi_request_t *req)
+{
+    if (req->sr_flags & SRF_DIR_IN) {
+        if (req->sr_flags & SRF_MAPBP) {
+            bp_dcache_wbinval(req->sr_bp);
+        } else if (req->sr_buffer && req->sr_buflen) {
+            dki_dcache_inval(req->sr_buffer, req->sr_buflen);
+        }
+    }
+    req->sr_ha = NULL;
+    if (req->sr_notify)
+        (*req->sr_notify)(req);
+}
+```
+
+`nvme_complete_request()` is reached from `nvme_intr()` → `nvme_process_completions()` →
+`nvme_handle_io_completion()`. It runs on the interrupt thread, whose address space is
+whatever happened to be current when the interrupt was taken.
+
+On the `SRF_ALENLIST` / `SRF_MAPUSER` path, `sr_buffer` is a **user** virtual address. The
+driver knows this — `nvme_prepare_alenlist()` asserts it at
+[`nvme_cmd.c:855`](nvme_cmd.c):
+
+```c
+if (!IS_KUSEG(req->sr_buffer)) {
+    cmn_err(CE_WARN, "nvme_prepare_alenlist: SRF_ALENLIST but address not KUSEG");
+```
+
+So the invalidate is handed a KUSEG address from a context that has no defined relationship to
+the address space that address belongs to. The R10000 speculative-miss workaround inside the
+cache layer is itself gated on the address being a *kernel* virtual address, so a user address
+does not get the handling the driver's comment says it is asking for.
+
+**The driver opts itself into this path.** `nvme_init_scsi_target_info()`
+([`nvme_scsi.c:928`](nvme_scsi.c)) advertises:
+
+```c
+soft->tinfo.si_ha_status = SRH_TAGQ | SRH_QERR0 | SRH_ALENLIST | SRH_MAPUSER | SRH_WIDE;
+```
+
+`SRH_MAPUSER` and `SRH_ALENLIST` are exactly the two bits `dksc` reads to decide whether to
+send raw user buffers straight through. Advertise them and you get the user-VA path; this
+completion handler then runs against it on every direct read.
+
+**What the contract actually is.** For the strategy path, cache maintenance belongs to the
+kernel layers above the host adapter, not to the adapter. `dksc`'s own I/O setup does not set
+`SRF_FLUSH` on normal reads and writes at all. DDPG, Table 16-4, p. 537, describes `SRF_FLUSH`
+as the *opt-in*:
+
+> The data cache for the buffer area should be flushed (for output) or marked invalid (for
+> input) prior to the command. This flag should be used whenever the buffer is local to the
+> driver, not mapped by a `buf_t` object.
+
+The driver has this backwards on both ends. Its *pre*-DMA cache work in
+`nvme_prepare_alenlist()` is entirely inside `if (req->sr_flags & SRF_FLUSH)` — so on the
+normal `dksc` path it is skipped, correctly. Its *post*-DMA work in `nvme_complete_request()`
+is not gated on anything — so it runs unconditionally, incorrectly, in the wrong context.
+
+**Why this hasn't obviously exploded.** `SRH_MAPUSER`/`SRH_ALENLIST` handling in `dksc` is
+compiled for the 64-bit platforms, so the user-VA case arises on IP30 and IP35 — which are
+built MP and are DMA-coherent, meaning most of what this call would do is redundant anyway. On
+IP32, `dksc` uses `SRF_MAP` with a kernel address, which is safe. So the bug is currently
+firing into a coherent machine's cache layer with a foreign address and mostly getting away
+with it. That is not a property to rely on.
+
+**Fix.** Delete the post-completion cache maintenance entirely and let the kernel do its job.
+If you keep anything, gate it on `SRF_FLUSH` and restrict it to the `SRF_MAPBP` case where you
+have a `buf_t` rather than a bare address:
+
+```c
+if ((req->sr_flags & (SRF_DIR_IN | SRF_FLUSH)) == (SRF_DIR_IN | SRF_FLUSH) &&
+    (req->sr_flags & SRF_MAPBP))
+        bp_dcache_wbinval(req->sr_bp);
+```
+
+Note that there is no `bp_dcache_inval()`; the available `buf_t` primitives are
+`bp_dcache_wbinval()` and `bp_dcache_flush(bp, ops)`. See 2.4.
+
+---
+
+#### 1.5 — Nothing establishes that inbound DMA has landed before the buffer is released — *Certain (mechanism) / Verify on target (impact)*
+
+**Where:** everywhere; the absence is the finding. No drain call of any kind appears in the
+driver. The only flush is `pciio_write_gather_flush()`
+([`nvme_cmd.c:78`](nvme_cmd.c), [`nvme_cpl.c:137`](nvme_cpl.c)), which flushes **PIO writes**
+— the doorbell — and says nothing about inbound DMA.
+
+**Contract.** DDPG, "Completing DMA Transfers," p. 750:
+
+> If it is necessary to establish that a DMA transfer is fully complete—all input data stored
+> in physical memory, all output data copied from memory—use the "drain" function that
+> corresponds to the way the map was activated. For example, if the map was activated using
+> `pciio_dmamap_list()`, you call `pciio_dmalist_drain()` to ensure that current DMA is
+> complete. **When the bus adapter uses prefetch buffers or write-gather buffers, they are
+> flushed.**
+
+**And here is the structural problem.** DDPG Table 21-4 (p. 749) lists a drain for one-step
+translations — `pciio_dmaadr_drain()`, *"Complete any active DMA on a mapping established using
+`pciio_dmatrans_addr()`."* That entry point is **not among the functions IRIX 6.5 actually
+provides**. The drain primitives that exist are `pciio_dmamap_drain()` — for a map activated by
+`pciio_dmamap_addr()` — and `pciio_dmalist_drain()` — for `pciio_dmamap_list()`. Both require a
+DMA *map*. There is no drain for a `pciio_dmatrans_addr()` mapping.
+
+So this is not "they forgot to call a function." **By choosing one-step translation for the
+data path, the driver has structurally foreclosed the only documented mechanism for
+guaranteeing inbound DMA has landed.** That is the single most important architectural gap in
+the driver, and it is the accurate version of the "DMA problem" flagged earlier.
+
+**What the driver substitutes.**
+
+- A dummy MMIO read of `CSTS` at the top of the completion loop,
+  [`nvme_cpl.c:111`](nvme_cpl.c): `NVME_RD(soft, NVME_REG_CSTS); // make PCI bridge complete
+  all DMA write transactions`. A read of a device register does force posted writes in that
+  direction to complete, but it is an inference about bridge behaviour, not a documented
+  guarantee, and it does not address prefetch buffers.
+- `PCIBR_BARRIER` on read-direction mappings, [`nvme_cmd.c:808`](nvme_cmd.c):
+  ```c
+  #if defined(IP30) || defined(IP35)
+                                    | ((flags & NF_WRITE) ? PCIIO_PREFETCH : PCIBR_BARRIER)
+  #endif
+  ```
+  This is the right instinct and it is a real Bridge mechanism. But note the `#if`: **on IP32
+  (O2) there is no barrier attribute and no drain — nothing at all.**
+
+**What actually goes wrong.** A completion is observed while inbound data is still in the
+bridge's buffers. The filesystem reads the buffer and gets a partially-stale block. On XFS
+that surfaces as intermittent bad blocks, metadata corruption, and eventually a panic in the
+filesystem rather than in the driver — which is why it is hard to attribute. It is
+load-dependent: invisible on a lightly-used volume, visible under `diskperf`, a large `tar`, or
+a multithreaded workload. This matches the symptom pattern of the driver's own history, whose
+commit log includes *"hopefully this will help dma issues?"*
+
+**Honest caveat.** IRIX's own shipped PCI host-adapter drivers also do not call drain functions
+on their data paths; they rely on the Bridge's ordering attributes, as this driver does on
+IP30/IP35. So the *absence of a drain call* is not by itself proof of a bug. What makes it a
+finding here is (a) IP32 gets neither a barrier nor a drain, and (b) the driver has no way to
+add one without changing its mapping strategy. Treat the priority as: fix IP32 first, then
+restructure.
+
+**Fix.** Two options.
+
+*Minimum:* extend the barrier to IP32 or, if the O2's PCI implementation offers no equivalent
+attribute, force a read of a controller register after the completion-queue read and before
+`nvme_complete_request()` on that platform — i.e. make the existing `CSTS` read
+unconditional and document it as the O2 ordering mechanism.
+
+*Correct:* move the data path to a DMA map. Allocate one `pciio_dmamap_t` per outstanding
+command at attach time, translate the alenlist in one shot with
+`pciio_dmamap_list(map, al, PCIIO_INPLACE)`, walk the *translated* list to build PRPs, and at
+completion call `pciio_dmalist_drain()` followed by `pciio_dmamap_done()`. `PCIIO_INPLACE` is
+documented (DDPG p. 749) as *"Translate alenlists in place instead of copying them,"* so this
+costs no extra allocation. This also gives the driver a correct place to release mapping
+resources — see 2.7.
+
+---
+
+### Tier 2 — Contract violations and data-integrity exposure
+
+---
+
+#### 2.1 — Ordered and head-of-queue tags are not barriers — *Certain*
+
+**Where:** [`nvme_scsi.c:638`–`655`](nvme_scsi.c)
+
+```c
+    /*
+     * For ordered or head-of-queue tagged commands, issue a special flush first
+     * to ensure proper ordering semantics. The flush will complete before this
+     * command starts executing.
+     */
+    if (req->sr_tag == SC_TAG_ORDERED || req->sr_tag == SC_TAG_HEAD) {
+        rc = nvme_cmd_special_flush(soft);
+        ...
+    }
+```
+
+The comment is false. `nvme_cmd_special_flush()`
+([`nvme_cmd.c:1590`–`1619`](nvme_cmd.c)) submits a Flush and returns — it never waits.
+
+**Contract.** NVMe 1.0e, §7.1 "Introduction," p. 103:
+
+> Except for fused operations, there are no ordering restrictions for processing of the
+> commands within or across Submission Queues. Host software should not place commands in the
+> list that may not be re-ordered arbitrarily. Data may or may not be committed to the NVM
+> media in the order that commands are received.
+
+and §6.3 "Command Ordering Requirements and Atomic Write Unit," p. 95:
+
+> If there are ordering requirements between commands, host software or the associated
+> application is required to enforce that ordering above the level of the controller.
+
+Queueing a Flush into the same submission queue establishes nothing. The Flush, the writes
+before it, and the write after it may all be reordered.
+
+**What it costs.** `SC_TAG_ORDERED` is the SCSI layer's write-barrier primitive. Journalling
+filesystems use it to guarantee that log records reach media before the metadata they
+describe. Break the barrier and nothing goes wrong while the machine is up — the failure only
+materialises after an unclean shutdown, as a journal that replays into an inconsistent state.
+This is the classic "worked fine for months, then one power cut ate the filesystem" defect.
+
+**Fix.** Make the barrier real. Either:
+
+- Drain the I/O queue before submitting the tagged command (wait for `outstanding == 0`),
+  submit the Flush, wait for *its* completion, then submit the tagged command; or
+- Serialise properly: quiesce, Flush synchronously, then release.
+
+Both cost latency, which is the honest price of a barrier. If you would rather not pay it,
+the alternative is to stop advertising `SRH_TAGQ` in `si_ha_status`
+([`nvme_scsi.c:928`](nvme_scsi.c)) so the layer above never asks for ordered tags in the first
+place. What is not acceptable is advertising the capability and not implementing it.
+
+---
+
+#### 2.2 — The drive's volatile write cache has no flush path in normal operation — *Certain*
+
+This is the finding that ties 1.3, 2.1, and the Makefile's build options together.
+
+The driver reports the write cache as enabled. `nvme_scsi_mode_sense()`
+([`nvme_scsi.c:402`](nvme_scsi.c)) synthesises a Caching mode page with:
+
+```c
+cachePage[2] = 0x04;  /* WCE=1 (write cache enabled), RCD=0 */
+```
+
+Meanwhile:
+
+- `dksc` does not issue SYNCHRONIZE CACHE on its normal I/O or shutdown paths.
+- The driver's SYNCHRONIZE CACHE handler completes before the flush does (1.3).
+- Ordered tags are not barriers (2.1).
+- `nvme_scsi_dump()` does issue a Flush, but reports failure and is the wrong hook (1.2).
+
+Net result: **on a running IRIX system there is no code path that reliably commits the NVMe
+controller's volatile write cache to NAND.** Every acknowledged write is a write the drive is
+free to lose on power removal.
+
+The Makefile knows this. It offers two mutually exclusive mitigations:
+
+```
+# DISABLE_WC=1 : disable volatile write cache globally at init via Set Features.
+# ENABLE_FUA=1 : set Force Unit Access bit on every NVMe Write command.
+# Both achieve the same safety goal (no acknowledged write lost on power-off)
+```
+
+But they are gated to a single configuration:
+
+```
+#if $(DISABLE_WC) == "1" && $(CPUBOARD) == "IP32" && $(BUILTIN) == "1"
+```
+
+`CPUBOARD == "IP32" && BUILTIN == "1"`. **IP30 and IP35 users cannot enable either mitigation
+from the Makefile, and neither can any IP32 user running the loadable module.** There is a
+runtime `nvmectl` override (`NVME_IOC_SET_FUA`, honoured at
+[`nvme_cmd.c:731`](nvme_cmd.c)), which is the escape hatch — but it is off by default and
+undocumented in the README's build instructions.
+
+**Fix, in order of preference:**
+
+1. Implement a real synchronous flush (1.3) and wire it to a barrier (2.1). This is the
+   correct answer and it lets you keep the write cache.
+2. Until then, remove the `CPUBOARD`/`BUILTIN` gate so `DISABLE_WC` and `ENABLE_FUA` are
+   available on all three platforms and both build modes, and make one of them the **default**.
+3. Document in the README that without one of these, an unclean power-off can lose
+   acknowledged writes. Right now the README's "boot from NVMe — live dangerously!" section
+   reads as bravado about the boot procedure; the actual danger is here.
+
+---
+
+#### 2.3 — PCI Cache Line Size written in the wrong units; latency timer de-tuned — *Certain*
+
+**Where:** [`nvmedrv.c:1464`–`1465`](nvmedrv.c)
+
+```c
+    /*
+     * Configure PCI cache line size and latency timer to match system.
+     * Cache line size of 128 bytes (0x80) matches SGI system cache line size.
+     * This is important for proper DMA performance.
+     */
+    pciio_config_set(soft->pci_vhdl, PCI_CFG_LATENCY_TIMER, sizeof(uint8_t), (uint64_t)0xF0);
+    pciio_config_set(soft->pci_vhdl, PCI_CFG_CACHE_LINE,    sizeof(uint8_t), (uint64_t)0x80);
+```
+
+The comment gives away the error: the PCI Cache Line Size register is expressed in **32-bit
+dwords**, not bytes. `0x80` is 128 dwords = **512 bytes**. To express 128 bytes you write
+`0x20`.
+
+**Contract.** O2 DDPG, "PCI Configuration Registers," p. 386, describing what the kernel has
+already programmed before `attach()` is called:
+
+> **Cache Line Size** — `0x20` (32, 32-bit words, or 128 bytes).
+> **Latency Timer** — `0x30` (48 clocks).
+
+and, p. 391:
+
+> For a PCI bus master device, the `pfxattach()` function should set the Cache Line Size
+> register to 128 (the size of a cache line in all Silicon Graphics systems).
+
+So the kernel had it right and the driver overwrites it with a value four times too large.
+Neither of IRIX's shipped PCI host-adapter drivers touches these registers at all.
+
+**Why it matters.** A bus master consults Cache Line Size to decide when it may use Memory
+Write and Invalidate and how to size Memory Read Multiple bursts. Telling a device the host
+cache line is 512 bytes when it is 128 invites it to issue MWI for a 512-byte region of which
+it is only writing part — which invalidates host cache lines whose contents were never
+supplied. That is a corruption mechanism, not just a performance one. Whether it fires depends
+on whether the particular NVMe controller behind the PCIe bridge uses MWI, which is why this
+shows up as "works with the Liteon, corrupts with something else."
+
+The latency timer at `0xF0` (240 clocks against the kernel's 48) lets the NVMe bridge hold a
+shared 33/66 MHz PCI bus for five times longer than the platform expects. On an Octane with a
+shoebox, or a Fuel with other cards, that starves everything else on the bus.
+
+**Fix.** Write `0x20`, and delete the latency timer line entirely — the kernel's value is
+tuned for the platform.
+
+```c
+pciio_config_set(soft->pci_vhdl, PCI_CFG_CACHE_LINE, sizeof(uint8_t), (uint64_t)0x20);
+```
+
+---
+
+#### 2.4 — Write-back issued after a DMA input — *Likely*
+
+**Where:** [`nvme_cpl.c:68`](nvme_cpl.c)
+
+```c
+if (req->sr_flags & SRF_DIR_IN) {
+    if (req->sr_flags & SRF_MAPBP) {
+        bp_dcache_wbinval(req->sr_bp);
+```
+
+**Contract.** DDPG, "Managing Memory for Cache Coherency," Table 8-18 and the rules that
+follow it, p. 230:
+
+> - Call `dki_dcache_inval()` prior to doing DMA input. This ensures that when you refer to the
+>   received data, it will be loaded from real memory.
+> - Call `dki_dcache_wb()` prior to doing DMA output. This ensures that the latest contents of
+>   cache memory are in system memory for the device to load.
+> - Call `dki_dcache_wbinval()` prior to a device operation that samples memory and then stores
+>   new data.
+
+and the hazard, stated at p. 14:
+
+> If it writes memory, the input data can be destroyed when the CPU writes the modified cache
+> line back to memory.
+
+Writing back *after* an input is exactly the described corruption path.
+
+**Why it is graded *Likely* rather than *Certain*.** In practice R10000 speculation only pulls
+in clean lines, so the write-back degenerates to an invalidate and nothing is lost. The bug
+only bites if a cache line covering the DMA target became dirty between submission and
+completion. It is the wrong primitive with a benign common case.
+
+**Constraint on the fix.** There is no `bp_dcache_inval()`. The available `buf_t` primitives
+are `bp_dcache_wbinval()` and `bp_dcache_flush(bp, ops)`, the latter taking a cache-operation
+mask. So the clean fix is not "call the invalidate-only variant" — it is to **delete the
+post-completion call altogether** per 1.4, which resolves 2.4 as a side effect. If you must
+keep something, `bp_dcache_flush()` with an invalidate-only mask is the expressive form.
+
+---
+
+#### 2.5 — No error-recovery ladder — *Certain*
+
+Three separate gaps that compound.
+
+**(a) The abort entry point is a stub.** [`nvme_scsi.c:1029`](nvme_scsi.c):
+
+```c
+int
+nvme_scsi_abort(scsi_request_t *req)
+{
+    return 1;
+}
+```
+
+`SCI_ABORT` is the SCSI layer's only lever for cancelling a stuck command. Registering a
+function that does nothing but claim success means the layer above believes recovery happened
+when it did not.
+
+**(b) Controller fatal status is never polled at runtime.** `CSTS.CFS` is read during
+initialisation ([`nvmedrv.c:1304`](nvmedrv.c), [`:1357`](nvmedrv.c)) and never again. A
+controller that raises CFS mid-operation stops completing commands, and nothing notices.
+
+**(c) The timeout path aborts forever and never escalates.** `nvme_check_timeouts()`
+([`nvmedrv.c:3623`–`3641`](nvmedrv.c)):
+
+```c
+if (elapsed > timeout_limit) {
+    nvme_aborted_fifo_add(soft, req);
+    soft->io_requests[cid].start_time = now;   /* re-arm, so we abort again in 2s */
+    nvme_admin_abort_command(soft, (ushort_t)cid);
+}
+```
+
+The CID is not freed, the request is not completed, and `start_time` is refreshed so the same
+command is re-aborted every two seconds indefinitely. There is no reset step.
+
+**Why relying on Abort alone does not work.** NVMe 1.0e, §5.1 "Abort command," p. 55:
+
+> An Abort command is a best effort command; the command to abort may have already completed,
+> currently be in execution, or may be deeply queued. It is implementation specific if/when a
+> controller chooses to complete the command when the command to abort is not found.
+
+And the number of concurrent Aborts is capped:
+
+> Host software may have multiple Abort commands outstanding, subject to the constraints of the
+> Abort Command Limit indicated in the Identify Controller data structure
+
+with a dedicated failure status:
+
+> **Abort Command Limit Exceeded:** The number of concurrently outstanding Abort commands has
+> exceeded the limit indicated in the Identify Controller data structure.
+
+The driver does not read ACL and does not bound the number of Aborts it issues. ACL is
+commonly 4. When a real stall occurs — which is exactly when many commands time out at once —
+the driver fires an Abort per stuck CID, blows past ACL, and the Aborts themselves start
+failing. The recovery mechanism silently stops working under precisely the conditions it
+exists for.
+
+**Fix — build the ladder:**
+
+1. Read and store ACL from Identify Controller; never have more than ACL Aborts outstanding.
+2. On timeout: Abort once. Give it a bounded window.
+3. If the command has not completed after N Abort attempts, or if `CSTS.CFS` is set, escalate
+   to a controller reset: disable `CC.EN`, wait for `CSTS.RDY` to clear, re-init the queues,
+   fail every outstanding CID back to the SCSI layer with `SC_CMDTIME`, and let `dksc` retry.
+4. Poll `CSTS.CFS` in the existing 100 ms timeout watchdog — it is already running.
+5. Implement `nvme_scsi_abort()` so it at least searches for the request's CIDs, issues the
+   Abort, and returns a truthful result.
+
+Step 3 is the important one. Without it, one lost completion permanently wedges the disk, and
+because the request is never completed, `dksc` blocks forever and the filesystem hangs.
+
+---
+
+#### 2.6 — READ CAPACITY(10) truncates above 2 TiB, and there is no READ CAPACITY(16) — *Certain*
+
+**Where:** [`nvme_scsi.c:273`–`305`](nvme_scsi.c)
+
+```c
+uint_t last_lba;
+...
+last_lba = (uint_t)(soft->num_blocks - 1);
+```
+
+`soft->num_blocks` is `__uint64_t`; `last_lba` is `uint_t`. With 512-byte logical blocks the
+32-bit field saturates at 2 TiB. The dispatch table in `nvme_scsi_command()`
+([`nvme_scsi.c:832`–`877`](nvme_scsi.c)) handles `SCSIOP_READ_CAPACITY` only — there is no
+SERVICE ACTION IN / READ CAPACITY(16) case.
+
+**What SCSI requires.** When the capacity exceeds what the 32-bit field can express, READ
+CAPACITY(10) must return `0xFFFFFFFF`, which tells the initiator to reissue as READ
+CAPACITY(16). Silently truncating instead reports a wrapped, much smaller capacity — IRIX
+partitions and formats to that wrong size, and the region beyond it is silently unreachable or,
+worse, aliased.
+
+**Fix.** Clamp and add the 16-byte form:
+
+```c
+if ((soft->num_blocks - 1) > 0xFFFFFFFFULL)
+    last_lba = 0xFFFFFFFF;
+else
+    last_lba = (uint_t)(soft->num_blocks - 1);
+```
+
+then implement READ CAPACITY(16). Note this only matters for drives above 2 TB, which is
+outside what the README reports testing — grade it accordingly, but it is a one-line clamp to
+avoid a nasty surprise.
+
+---
+
+#### 2.7 — No mapping resources are ever released — *Contract violation, currently benign*
+
+The driver never calls `pciio_dmamap_done()`. With one-step translation there is nothing to
+release, so nothing leaks today. It is listed because it becomes a live requirement the moment
+1.5's recommended restructuring is done.
+
+DDPG, "Deactivating Addresses and Maps," pp. 750–751:
+
+> Once you have created a mapping, the map is active. It remains active until you use the same
+> DMA map object to map a different buffer, or until you call either `pciio_dmamap_done()` or
+> `pciio_dmamap_free()`. … In some systems, it costs nothing to keep a DMA map active. In other
+> systems, an active map may tie up global hardware resources. It is a good idea to call
+> `pciio_dmamap_done()` when the I/O operation is complete.
+>
+> **Caution:** Never call `pciio_dmamap_done()` before the device has stopped sending data.
+> Memory corruption could result.
+
+Note the caution: `dmamap_done()` must come *after* the drain, not before. Ordering at
+completion must be: observe completion → `pciio_dmalist_drain()` → `pciio_dmamap_done()` →
+`sr_notify`.
+
+There is also a dormant hazard in the utility-buffer path. Under `NVME_UTILBUF_USEDMAP`
+([`nvmedrv.c:1757`](nvmedrv.c)) the driver allocates a map, takes an address from it, and never
+calls `done`. That branch is not compiled by default, and the matching
+`pciio_dmamap_free()` calls at [`nvmedrv.c:587`](nvmedrv.c) and [`:2256`](nvmedrv.c) are
+correctly inside the same `#ifdef` — so nothing is broken. Fix the `done` if you ever enable it.
+
+---
+
+### Tier 3 — Robustness and structure
+
+---
+
+#### 3.1 — `sr_ha` overloaded as a 32-bit reference count on a pointer field — *Certain*
+
+**Where:** [`nvme_scsi.c:613`](nvme_scsi.c), [`nvme_cmd.c:1483`](nvme_cmd.c),
+[`nvme_cmd.c:1540`](nvme_cmd.c)
+
+```c
+*(volatile int *)&(req->sr_ha) = 1;                  /* nvme_scsi.c:613 */
+atomicAddInt((int *)&req->sr_ha, commands);          /* nvme_cmd.c:1483 */
+refcount = atomicAddInt((int *)&req->sr_ha, -1);     /* nvme_cmd.c:1540 */
+```
+
+`sr_ha` is a `void *` reserved for the host adapter's own use, so using it as scratch is
+legitimate in principle — IRIX's own drivers use it as a request linked-list pointer. Using it
+as a 32-bit counter is not.
+
+On the IP30 and IP35 builds (`-64`), `sr_ha` is eight bytes and MIPS is big-endian, so a 4-byte
+access at `&sr_ha` touches the **high** word. The count therefore lives in the upper half of a
+pointer and the lower half is never initialised — it holds whatever the previous user of the
+request left there. Between submission and completion, `sr_ha` reads as
+`0x0000000N_<stale bits>`: a non-null, meaningless pointer.
+
+The comments in the code are wrong about this. [`nvme_scsi.c:750`](nvme_scsi.c):
+
+```c
+    /* If refcount reaches 0, all commands completed before we got here - call sr_notify
+     * sr_ha is already 0 (NULL) from the atomic decrement
+     */
+```
+
+It is not NULL on a 64-bit build. The code works anyway because
+`nvme_complete_request()` performs a full-width `req->sr_ha = NULL` before notifying. On IP32
+(`n32`, 4-byte pointers) the trick is exact.
+
+**Fix.** Stop overloading the field. Add a small per-request tracking structure — you already
+have `nvme_cmd_info_t io_requests[NVME_IO_QUEUE_SIZE]` — and put the count there, keyed by the
+first CID of the request. Then `sr_ha` can be left alone or used the conventional way.
+
+---
+
+#### 3.2 — About 2.1 KB of kernel stack consumed per I/O — *Certain*
+
+**Where:** [`nvme_scsi.c:599`](nvme_scsi.c) and [`nvmedrv.h:424`–`437`](nvmedrv.h)
+
+```c
+nvme_rwcmd_state_t s;          /* stack local in nvme_scsi_read_write() */
+```
+
+```c
+typedef struct nvme_rwcmd_state_s {
+    ...
+    unsigned int cids[NVME_IO_QUEUE_SIZE];   /* 512 * 4 = 2048 bytes */
+    nvme_command_t cmd;                      /* 64 bytes */
+} nvme_rwcmd_state_t;
+```
+
+That is roughly 2.1 KB on the stack of a function sitting at the bottom of a
+filesystem → `dksc` → SCSI → host-adapter call chain, on a kernel stack that is not large.
+
+**Fix.** The array is sized for the worst case but the common case needs one entry. Either
+allocate the `cids` array from the per-CID tracking table, or split: keep a small inline array
+(say 8 entries) for the common case and fall back to a preallocated per-controller array under
+the existing `io_requests_lock` for larger splits.
+
+---
+
+#### 3.3 — Maximum transfer size: wrong divisor, and not clamped by PRP capacity — *Certain*
+
+**Where:** [`nvme_cpl.c:215`–`223`](nvme_cpl.c)
+
+```c
+if (soft->mdts == 0) {
+    soft->max_transfer_blocks = 0xFFFF;  /* 32MB with 512-byte blocks */
+} else {
+    uint_t max_pages = (1 << soft->mdts);
+    soft->max_transfer_blocks = (max_pages * (1u << (soft->min_page_size + 12))) / 512;
+}
+```
+
+**(a) Hard-coded 512.** MDTS gives a size in *bytes*; converting to blocks must divide by the
+namespace's logical block size, not by a literal 512. NVMe 1.0e, Identify Controller, MDTS
+field, p. 79:
+
+> The value is in units of the minimum memory page size (CAP.MPSMIN) and is reported as a power
+> of two (2^n). A value of 0h indicates no restrictions on transfer size.
+
+The `(1u << (min_page_size + 12))` part is right. The `/ 512` is not: on a 4Kn namespace it
+produces a limit eight times too large, and the controller rejects the resulting command with
+Invalid Field in Command. The structural reason is ordering — Identify Controller runs before
+Identify Namespace, so `soft->block_size` is not known yet. The value is simply never
+recomputed afterwards.
+
+**(b) Not clamped by what the driver can describe.** `NVME_CMD_MAX_PRPS` is 4
+([`nvmedrv.h:242`](nvmedrv.h)), and `nvme_io_cid_store_prp()`
+([`nvme_cmd.c:1567`](nvme_cmd.c)) returns `-1` past that:
+
+```c
+for (i = 0; i < NVME_CMD_MAX_PRPS; i++)
+    if (soft->io_requests[cid].prpidx[i] == -1) { ...; return 0; }
+return -1;
+```
+
+With a 4 KB NVMe page, each PRP list page holds 512 entries of which 511 are usable (the last
+chains to the next page). Four pages therefore describe at most 4 × 511 + 1 = 2045 pages ≈
+**8 MB**. Meanwhile `max_transfer_blocks = 0xFFFF` when MDTS is 0 advertises **32 MB**. A
+transfer between those two figures fails with a hard adapter error rather than being split.
+
+In practice IRIX caps requests well below this via `maxdmasz`, which is why it has not been
+hit. It is still an inconsistency waiting for a tuned system.
+
+**Fix.**
+
+```c
+/* recompute after Identify Namespace, once block_size is known */
+max_bytes = soft->mdts ? ((1u << soft->mdts) * (1u << (soft->min_page_size + 12)))
+                       : (NVME_CMD_MAX_PRPS * (soft->nvme_prp_entries - 1) + 1)
+                         * soft->nvme_page_size;
+/* clamp by PRP describing capacity regardless */
+prp_cap  = (NVME_CMD_MAX_PRPS * (soft->nvme_prp_entries - 1) + 1) * soft->nvme_page_size;
+if (max_bytes > prp_cap) max_bytes = prp_cap;
+soft->max_transfer_blocks = max_bytes / soft->block_size;
+```
+
+---
+
+#### 3.4 — `sizeof(NBPP)` used as a length — *Certain, currently inert*
+
+Ten sites: [`nvme_cmd.c:142`, `:144`, `:207`, `:209`, `:262`, `:264`](nvme_cmd.c);
+[`nvme_cpl.c:194`, `:251`, `:252`, `:303`](nvme_cpl.c).
+
+```c
+heart_dcache_wb_inval((caddr_t)soft->utility_buffer, sizeof(NBPP));
+```
+
+`NBPP` is an integer constant (4096 on IP32, 16384 on IP30/IP35), so `sizeof(NBPP)` is
+`sizeof(int)` = **4**. Every one of these operates on the first four bytes of the buffer rather
+than a page. The intended argument is `NBPP`.
+
+It is currently inert because the utility buffer is allocated `VM_UNCACHED`
+([`nvmedrv.c:1750`](nvmedrv.c)), which makes all ten calls no-ops regardless of length. That
+is accident, not design: the day someone makes that buffer cacheable for performance, Identify
+and Get Features start returning stale data beyond the first dword — and the symptom will be a
+wrong capacity or a wrong serial number, which is very hard to trace back here.
+
+**Fix.** `sizeof(NBPP)` → `NBPP`, all ten sites.
+
+---
+
+#### 3.5 — Target info reinitialised on every query, masking an unfound bug — *Likely*
+
+**Where:** [`nvme_scsi.c:918`–`932`](nvme_scsi.c), [`:971`](nvme_scsi.c)
+
+```c
+/* Re-initialize the target info structure every time to work around corruption */
+nvme_init_scsi_target_info(soft);
+return &soft->tinfo;
+```
+
+`si_qdepth` ("max queue depth so far") and `si_qlimit` ("max queue depth reached") are fields
+the host adapter maintains as running state and the layer above reads. Resetting them to zero
+on every `SCI_INQ` call discards that state.
+
+Setting them once at initialisation is the shipped idiom, and doing so is fine. Doing it *on
+every call* to "work around corruption" is not a fix, it is a symptom being suppressed. Two
+things are worth chasing:
+
+- Something is writing over `soft->tinfo`. Since `soft->tinfo.si_inq = soft->inq_data` and
+  `si_sense = soft->sense_data` are pointers into the soft state, a length bug in the INQUIRY
+  or sense-data synthesis is a plausible culprit — check `inq_data` and `sense_data` sizing
+  against `SCSI_INQUIRY_LEN` (64) and `SCSI_SENSE_LEN` (64).
+- `si_maxq = 32` should be reconciled with the rest of the driver. The CID space is 512
+  entries and the submission queue holds 512 with one slot reserved by the full-queue test
+  (`next_tail == q->sq_head`, [`nvme_cmd.c:27`](nvme_cmd.c)), so 511 usable. 32 is a safe
+  under-advertisement, but it should be a deliberate constant with a comment, not a magic
+  number.
+
+---
+
+#### 3.6 — Timer callback holds a mutex across a nested submission — *Verify on target*
+
+**Where:** [`nvmedrv.c:3595`–`3644`](nvmedrv.c)
+
+`nvme_check_timeouts()` takes `soft->io_requests_lock` and holds it across the entire CID scan,
+calling `nvme_admin_abort_command()` inside the loop — which submits to the admin queue and
+therefore takes `soft->admin_queue.lock`. The whole thing runs from a `fast_itimeout()`
+callback registered at `pldisk`.
+
+**Context.** DDPG, "Timer Support," p. 253:
+
+> After a delay of at least the length requested, the function is called. The function is
+> entered asynchronously. On a uniprocessor, it can interrupt execution of an upper-half
+> routine. On a multiprocessor, it can execute concurrently with an upper-half routine or with
+> an interrupt handler or a different timeout function. (Use locks or mutexes for mutual
+> exclusion.)
+
+The guide sanctions mutexes here, so this is not a clear-cut violation. The concerns are
+ordering and latency rather than legality: holding `io_requests_lock` across a nested
+acquisition of `admin_queue.lock` creates a two-lock ordering that the submission and
+completion paths must never take in reverse. As written they do not — `nvme_process_completions()`
+releases `q->lock` before invoking the completion handler
+([`nvme_cpl.c:139`](nvme_cpl.c)) — but that is a property worth stating and defending rather
+than leaving implicit.
+
+**Fix.** Collect the timed-out CIDs into a small local array under the lock, drop the lock,
+then issue the Aborts. That removes the nesting entirely and shortens the hold time on the
+lock that every I/O submission needs.
+
+---
+
+#### 3.7 — Large physically-contiguous non-sleeping allocation at attach — *Likely*
+
+**Where:** [`nvme_cmd.c:1258`](nvme_cmd.c)
+
+```c
+soft->prp_pool = kvpalloc(pages, VM_UNCACHED | VM_PHYSCONTIG | VM_DIRECT | VM_NOSLEEP, 0);
+```
+
+With `NVME_PRP_POOL_SIZE = 64` and a 4 KB NVMe page, this asks for **256 KB of physically
+contiguous memory** in one shot, with `VM_NOSLEEP`. On a machine that has been up a while this
+can fail, and the failure path aborts the attach — so the disk simply does not appear, with a
+message only visible under `NVME_DBG`.
+
+The arithmetic itself checks out on both page sizes. On IP30/IP35, `NBPP` is 16384 and
+`nvme_page_size` falls back to 4096 (because most controllers report `CAP.MPSMAX` of 0), so
+`btop(64 × 4096)` = 16 system pages = 262144 bytes; the 64-bit bitmap covers exactly 64
+4 KB slots within it. Consistent.
+
+**Fix.** Either allocate the pool in several smaller contiguous chunks (each chunk needs its
+own base translation, which the current `prp_pool_phys + index × page_size` arithmetic assumes
+away), or promote the failure to an unconditional `CE_WARN` so a user can see why their drive
+did not attach. At minimum, make the failure visible.
+
+---
+
+#### 3.8 — `nvme_scsi_alloc()` ignores its options — *Certain, low impact*
+
+**Where:** [`nvme_scsi.c:895`–`902`](nvme_scsi.c)
+
+```c
+int
+nvme_scsi_alloc(vertex_hdl_t lun_vhdl, int opt, void (*cb)())
+{
+    return SCSIALLOCOK;
+}
+```
+
+`opt` may carry `SCSIALLOC_EXCLUSIVE`, `SCSIALLOC_NOSYNC`, and an 8-bit queue depth in
+`SCSIALLOC_QDEPTH`. The contract for `SCSIALLOC_EXCLUSIVE` is to return `EBUSY` if the device
+is already allocated. Returning `SCSIALLOCOK` unconditionally means an exclusive open always
+succeeds, so a raw-device utility can operate on a disk that is currently mounted. `nvme_scsi_free()`
+is likewise empty, so there is no reference count to check against.
+
+**Fix.** Maintain an open count in the soft state; honour `SCSIALLOC_EXCLUSIVE`; decrement in
+`nvme_scsi_free()`.
+
+---
+
+#### 3.9 — IP35 32-bit direct-mapping node is never considered — *Verify on target*
+
+**Where:** all `pciio_dmatrans_addr()` call sites.
+
+**Contract.** DDPG, "Setting 32-bit Direct Mapping Node," p. 60:
+
+> **Note:** The following information does not apply to O2 or Octane systems.
+>
+> When a PCI driver uses 32-bit direct mapping (with the `pciio_dmatrans_addr()` and
+> `pciio_dmatrans_list()` functions), the memory space that is being mapped must be on one
+> specific node. The default is node zero. You can use the `DEVICE_ADMIN` statement to change
+> the mapping node for a specific PCI bus.
+
+and p. 751:
+
+> If the PCI device supports only 32-bit addresses, the one-step mapping functions map the PCI
+> address space to system memory on one specific node. This means that any memory (DMA buffers)
+> that you want to map must be allocated on that node. … You can use the
+> `pcibr_get_dmatrans_node()` function to obtain the node that is being used by a specific PCI
+> bus.
+
+This is explicitly not a concern on O2 or Octane. It is a concern on Origin 350 and Tezro,
+where a buffer on the wrong node makes the translation fail — which lands you in 1.1.
+
+The driver requests `PCIIO_DMA_A64` on IP30/IP35 (`DMATRANS64`, [`nvmedrv.h:21`](nvmedrv.h)),
+which should sidestep the 32-bit window entirely. Whether A64 actually reaches the NVMe
+controller depends on the PCI-to-PCIe bridge forwarding dual-address cycles. That is worth
+confirming on a Fuel with a PLX bridge, because if A64 is silently not in effect you are on
+the 32-bit direct map with all the node constraints and no checks (1.1).
+
+**Fix.** Check the translation results (1.1); if a failure is observed on IP35, call
+`pcibr_get_dmatrans_node()` and document the `DEVICE_ADMIN … PCIBUS_DMATRANS_NODE=…` line users
+need in `/var/sysgen/system/irix.sm`.
+
+---
+
+#### 3.10 — Miscellaneous
+
+- **Hard-coded ready timeout.** [`nvmedrv.c:1838`](nvmedrv.c) calls
+  `nvme_wait_for_ready(soft, 1, 60000)` with a comment saying "timeout from CAP.TO" — the
+  60000 is a literal. `CAP.TO` is read and used correctly elsewhere
+  ([`nvmedrv.c:2200`](nvmedrv.c)); use it here too.
+- **`MODE SENSE` writes into `sr_buffer` without a null check.**
+  [`nvme_scsi.c:349`](nvme_scsi.c) does `bzero(buffer, req->sr_buflen)` after checking only
+  `req->sr_buflen < headerSize`. The documented contract (DDPG Table 16-3, p. 536) is that
+  `sr_buffer` "must be zero when `sr_bp` is supplied and `SRF_MAPBP` is specified in
+  `sr_flags`." A MODE SENSE arriving with `SRF_MAPBP` therefore null-dereferences. The same
+  applies to `nvme_scsi_inquiry()` ([`:158`](nvme_scsi.c)) and `nvme_scsi_read_capacity()`
+  ([`:288`](nvme_scsi.c)). Add a guard that fails these with `SC_REQUEST` rather than panicking.
+- **Retry path can request more commands than exist.** On a detected retry,
+  [`nvme_scsi.c:632`](nvme_scsi.c) sets `s.max_transfer_blocks = 1`, so a 512 KB request becomes
+  1024 single-block commands. `nvme_io_cid_alloc()` rejects that early (free count can never
+  reach 1024), so it degrades to `ST_BUSY` rather than overflowing `s.cids[512]` — correct, but
+  by a margin of one check. Cap `s.commands` explicitly.
+
+---
+
+## 3. Things that look wrong but are not
+
+Listed so they are not "fixed" into regressions. Each of these was checked and cleared.
+
+| Apparent issue | Verdict |
+|---|---|
+| `mutex_lock()` called from inside the interrupt handler (`nvme_process_completions`, [`nvme_cpl.c:112`](nvme_cpl.c)) | **Correct.** From IRIX 6.4 onward interrupt handlers run as kernel threads and may sleep. DDPG p. 188: *"There are no restrictions on the kernel services an interrupt handler may call. In particular, the interrupt handler is permitted to call services that could sleep."* and *"Mutual exclusion between the interrupt handler the driver top half can be done with mutex locks, instead of requiring the use of spinlocks."* IRIX's own shipped host-adapter drivers use `mutex_lock()` the same way. |
+| Per-page `pciio_dmatrans_addr()` instead of one-shot list translation | **Matches the shipped idiom.** DDPG p. 226 prescribes translate-then-walk, but IRIX's own PCI host-adapter drivers translate each scatter/gather segment individually with `pciio_dmatrans_addr()` and flags of the same shape (`PCIIO_DMA_DATA \| PCIIO_BYTE_STREAM \| PCIIO_DMA_A64` plus prefetch/barrier attributes). The reason to move to maps is to get access to a drain (1.5), not because per-page translation is wrong. |
+| `PCIBR_BARRIER` OR'd into a `pciio_dmatrans_addr()` flags word ([`nvme_cmd.c:808`](nvme_cmd.c)) | **Legal.** `PCIBR_*` and `PCIIO_*` occupy disjoint bits in the same flags word, and `PCIBR_BARRIER` has no `PCIIO_` equivalent, so this is the only way to request the barrier attribute. No collision. |
+| `device_desc_intr_swlevel_set(dev_desc, splhintr)` ([`nvmedrv.c:2387`](nvmedrv.c)) | **Matches the shipped idiom** — IRIX's Adaptec PCI SCSI driver sets exactly the same value. DDPG p. 60 notes the `INTR_SWLEVEL` default "normally should not be changed," but that refers to the `DEVICE_ADMIN` administrative override, not the driver's own device descriptor. |
+| `CC.MPS` programming ([`nvmedrv.c:1828`](nvmedrv.c)) | **Correct.** `((soft->nvme_page_shift - 12) << NVME_CC_MPS_SHIFT)` is consistent with the `nvme_page_size` the PRP builder uses, and the fallback at [`nvmedrv.c:1536`](nvmedrv.c) correctly drops to `CAP.MPSMIN` when the 16 KB system page is outside the controller's supported range — which is the normal case on IP30/IP35, since most controllers report `MPSMAX` of 0. |
+| Byte-swap scheme | **Coherent.** Queues and PRP lists translate with `PCIIO_WORD_VALUES` and are written with plain stores; data buffers translate with `PCIIO_BYTE_STREAM`. DDPG p. 749: *"You should specify either `PCIIO_BYTE_STREAM` or `PCIIO_WORD_VALUES`; there is no default."* Both are specified, and the accessor macros match the flag in each case. `PHYS64_LO`/`PHYS64_HI` place the halves correctly. |
+| PRP construction — first-page offset, PRP2, list chaining | **Conforms to NVMe 1.0e §4.3, p. 45:** *"The first PRP entry contained within the command may have a non-zero offset within the memory page. … All other PRP and PRP List entries shall have a memory page offset of 0h"* and *"the last PRP entry before the end of the memory page shall be a pointer to the next PRP List."* The clamp at [`nvme_cmd.c:786`](nvme_cmd.c) that shortens the first fetch to the remainder of the first NVMe page is what makes subsequent entries page-aligned when `nvme_page_size < NBPP`, and the chain is written at index `nvme_prp_entries - 1`. Both correct. |
+| `HEART_INVALIDATE_WAR` conditional | **Correct macro name** — it is the same conditional the Octane platform header uses to declare `heart_invalidate_war()`, `heart_need_invalidate()`, and `bp_heart_invalidate_war()`. Not an invention. |
+| `IP30` / `IP32` never passed by the project Makefile | **Supplied by the kernel build rules.** The included `/var/sysgen/Makefile.kernio` (and its loadable-module counterpart) derives `-DIP30` / `-DIP32` from `CPUBOARD`, which the project Makefile sets before the include. The `#ifdef IP30` blocks do compile in. Worth a one-time `cc -E` check on the target, but not a defect. |
+| PRP pool page arithmetic | **Consistent** at both `NBPP` values — see 3.7. |
+
+---
+
+## 4. What proper and safe design execution looks like here
+
+Four contracts the driver needs to satisfy. Findings above map onto them.
+
+### 4.1 The DMA contract
+
+> A buffer handed to the device is not the host's again until the platform says the transfer is
+> complete.
+
+Today the driver has no way to say that, because one-step translation has no drain. The
+correct shape:
+
+```
+submit:     alenlist (physical)
+            -> pciio_dmamap_list(map, al, PCIIO_INPLACE)   [one call, whole list]
+            -> walk translated list with a cursor, maxlength = nvme_page_size
+            -> build PRPs, ring doorbell
+
+complete:   observe CQE
+            -> pciio_dmalist_drain(vhdl, al)               [inbound data now in memory]
+            -> pciio_dmamap_done(map)                      [release mapping resources]
+            -> sr_notify
+```
+
+The ordering matters and the guide is explicit about it (2.7): never `done()` before the
+device has stopped sending data.
+
+If the restructure is too invasive for now, the minimum is that IP32 gets *something* — the
+`CSTS` read made unconditional and documented as the ordering mechanism on that platform.
+
+### 4.2 The completion contract
+
+> A request is notified exactly once, and only after everything it promised has happened.
+
+Three current violations: SYNCHRONIZE CACHE notifies before its flush (1.3); the crash-dump
+entry point reports failure on success (1.2); and the reference count that enforces
+"exactly once" lives in the upper half of a pointer and is wiped by the `done:` label (3.1).
+
+Give each request a real tracking record. `nvme_cmd_info_t` already exists — put the count
+there, keyed by first CID, and make the notify decision from that record rather than from a
+field the SCSI layer also touches.
+
+### 4.3 The recovery contract
+
+> Every stall has a bounded escalation that ends in the request being returned to the caller.
+
+Today the ladder is: Abort, Abort, Abort, forever. Build the rest of it (2.5): bound Aborts by
+ACL, poll `CSTS.CFS` in the watchdog that is already running, and put a controller reset at the
+top that fails all outstanding CIDs back with `SC_CMDTIME`. `dksc` knows how to retry a failed
+command; it does not know how to recover from one that never returns.
+
+### 4.4 The integrity contract
+
+> Data the OS believes is on stable media is on stable media.
+
+Three independent holes: no working SYNCHRONIZE CACHE (1.3), no barrier behind ordered tags
+(2.1), and mitigations that exist but are gated to one build configuration (2.2). Any one of
+them alone would be enough to lose a filesystem across a power cut.
+
+Until a real flush exists, the honest default is FUA on, and the README should say so.
+
+---
+
+## 5. Prioritised remediation plan
+
+Ordered by risk removed per line of code changed.
+
+**Immediate — hours**
+
+1. **1.1** — Check the five `pciio_dmatrans_addr()` returns. Removes a boot-time panic.
+2. **1.2** — `return 1` from `nvme_scsi_dump()`. One character; restores crash dumps.
+3. **2.3** — Cache Line Size `0x80` → `0x20`; delete the latency-timer override.
+4. **3.4** — `sizeof(NBPP)` → `NBPP`, ten sites.
+5. **2.6** — Clamp READ CAPACITY(10) to `0xFFFFFFFF`.
+
+**Short term — days**
+
+6. **1.3** — Make SYNCHRONIZE CACHE asynchronous-and-notified-on-completion, like READ/WRITE.
+7. **1.4 / 2.4** — Delete the post-completion cache maintenance in `nvme_complete_request()`.
+8. **2.2** — Ungate `DISABLE_WC` / `ENABLE_FUA` for all platforms and both build modes; pick a
+   safe default; document it.
+9. **3.3** — Recompute `max_transfer_blocks` after Identify Namespace; clamp by PRP capacity.
+10. **3.6** — Collect timed-out CIDs under the lock, issue Aborts after dropping it.
+
+**Medium term — weeks**
+
+11. **2.5** — Build the recovery ladder: ACL-bounded Aborts, runtime `CSTS.CFS` polling,
+    controller reset, real `nvme_scsi_abort()`.
+12. **2.1** — Make ordered tags a real barrier, or stop advertising `SRH_TAGQ`.
+13. **1.5 / 2.7** — Restructure the data path onto `pciio_dmamap_list()` + drain + `done`.
+14. **3.1 / 3.2** — Per-request tracking record; get `cids[512]` off the stack.
+
+Items 1–5 are worth doing even though 13 will later touch some of the same code. They are
+cheap and they each remove a distinct, currently-live failure.
+
+---
+
+## 6. Verification checklist for the target machine
+
+Things this review could not settle from the source alone.
+
+- [ ] Run `cc -E` on one translation unit for each `CPUBOARD` value and confirm `IP30` / `IP32`
+      / `IP35` are actually defined, and that `HEART_INVALIDATE_WAR` and the `IP30` blocks are
+      consistently on or off together.
+- [ ] On a Fuel with a PLX bridge, confirm `PCIIO_DMA_A64` is actually in effect — i.e. that
+      the bridge forwards dual-address cycles to the NVMe controller. If not, you are on the
+      32-bit direct map and 3.9 applies.
+- [ ] Instrument the five translations from 1.1 and confirm none returns 0 on each platform.
+- [ ] Confirm whether the NVMe controllers in use assert Memory Write and Invalidate. If they
+      do, 2.3 is a corruption finding rather than a tuning one.
+- [ ] Read `ACL` from Identify Controller on each drive and record it; it determines the bound
+      needed in 2.5.
+- [ ] Reproduce 1.5 deliberately: run `diskperf -D` (direct I/O, which takes the
+      `SRF_MAPUSER`/`SRF_ALENLIST` path) with data verification, on IP32 specifically, and see
+      whether verification failures appear.
+- [ ] Confirm `soft->inq_data` and `soft->sense_data` are at least `SCSI_INQUIRY_LEN` (64) and
+      `SCSI_SENSE_LEN` (64) bytes — this is the most likely source of the `tinfo` corruption
+      that 3.5 is papering over.
+
+---
+
+## Bibliography
+
+**Silicon Graphics technical publications**
+
+1. Silicon Graphics, Inc. *IRIX® Device Driver Programmer's Guide.* Document Number
+   007-0911-210. November 2003 (Record of Revision: version 210, "Incorporates information for
+   the IRIX 6.5.22 release"). 900 pp. Written by David Cortesi, John Raithel, Bill Tuthill and
+   Anita Manders; updated by Julie Boney and Steven Levine. © 1998–2003 Silicon Graphics, Inc.
+   https://irix7.com/techpubs/007-0911-210.pdf
+   *Chapters and sections cited:* Ch. 1 "Physical and Virtual Memory" — "Cache Use and Cache
+   Coherency," "Cache Coherency in Uniprocessors" (p. 13–14); Ch. 2 "Device Configuration" —
+   "Setting 32-bit Direct Mapping Node," "Setting Interrupt Targets and Levels" (p. 60);
+   Ch. 7 "Structure of a Kernel-Level Driver" — "Interrupts as Threads," "Mutual Exclusion,"
+   "Using Locking Between Top and Bottom Half" (pp. 188–190); Ch. 8 "Device Driver/Kernel
+   Interface" — "Address/Length Lists" (p. 203), "Using Address/Length Lists" (p. 225),
+   "Setting Up a DMA Transfer" (p. 226), "Managing Memory for Cache Coherency" incl.
+   Table 8-18 (p. 230), "Timer Support" (p. 253); Ch. 16 "SCSI Device Drivers" —
+   "Using `scsi_command()`," Table 16-3 input fields (p. 536), Table 16-4 `sr_flags` values
+   (pp. 537–538), Tables 16-5 to 16-8 returned values (pp. 539–541); Ch. 21 "Services for PCI
+   Drivers" — "Allocating DMA Maps" and flag values (pp. 748–749), Table 21-4 DMA map functions
+   (p. 749), "Using a DMA Map," "Mapping an Address/Length List," "Mapping a Specific Buffer,"
+   "Completing DMA Transfers," "Deactivating Addresses and Maps," "Using One-Step DMA
+   Translation" (pp. 749–751).
+
+2. Silicon Graphics, Inc. *IRIX® 6.3 for O2™ Device Driver Programming Guide.* Document Number
+   007-3443-002. 634 pp. Written by David Cortesi. © 1998 Silicon Graphics, Inc.
+   https://irix7.com/techpubs/007-3443-002.pdf
+   *Cited for:* Ch. 15 "PCI Device Drivers" — the PCI configuration registers the kernel
+   programs at probe time, including Cache Line Size `0x20` (32 32-bit words, or 128 bytes) and
+   Latency Timer `0x30` (48 clocks) (p. 386); and the instruction that a bus-master driver's
+   `attach()` should set Cache Line Size to 128 bytes, "the size of a cache line in all Silicon
+   Graphics systems" (p. 391). This edition states the PCI configuration values more explicitly
+   than 007-0911-210 and is the authority for §2.3.
+
+3. Silicon Graphics, Inc. *IRIX® Device Driver Programmer's Guide.* Document Number
+   007-0911-110. 882 pp. © 1996–1998 Silicon Graphics, Inc.
+   https://irix7.com/techpubs/007-0911-110.pdf
+   *Used as a cross-check* on the DMA map and cache-coherency chapters to confirm the guidance
+   in 007-0911-210 is long-standing rather than a late revision.
+
+4. Silicon Graphics, Inc. *IRIX™ Device Driver Programmer's Guide.* Document Number
+   007-0911-090. 868 pp. © 1996–1997 Silicon Graphics, Inc.
+   http://irix7.com/techpubs/007-0911-090.pdf
+   *Used as a cross-check,* as above.
+
+An HTML rendering of the IRIX 6.5 guide, useful for linking to individual sections, is mirrored
+at https://techpubs.jurassic.nl/manuals/0650/developer/DevDriver_PG/sgi_html/ — Chapter 21
+"Services for PCI Drivers" is at `ch21.html`. The site rejects some automated clients; the PDFs
+above are the reliable source.
+
+**Storage and bus specifications**
+
+5. NVM Express Workgroup. *NVM Express™ Specification, Revision 1.0e.* 23 January 2013.
+   127 pp. Incorporates ECNs 001–033.
+   https://nvmexpress.org/wp-content/uploads/NVM-Express-1_0e.pdf
+   *Sections cited:* §4.3 "Physical Region Page Entry and List," incl. Figures 9–11 (pp. 45–46);
+   §5.1 "Abort command" and the Abort Command Limit (p. 55); §5.11 "Identify command" —
+   Identify Controller data structure, MDTS and ACL fields (Figure 66, ~p. 79); §6.3 "Command
+   Ordering Requirements and Atomic Write Unit" (p. 95); §7.1 "Controller Architecture —
+   Introduction" (p. 103); §7.6 controller initialisation. This is the revision the driver's
+   own README names as its reference.
+
+6. PCI Special Interest Group. *PCI Local Bus Specification, Revision 2.3.* §6.2.4,
+   "Cache Line Size" — the register "specifies the system cacheline size in units of
+   32-bit words." Cited in §2.3 for the units; not redistributable, and the SGI-specific value
+   in reference 2 is the operative authority for this driver.
+
+**Primary source under review**
+
+7. techomancer. *irixnvme — An NVMe driver for SGI IRIX 6.5.* Revision `88e99f5`, 26 May 2026.
+   https://github.com/techomancer/irixnvme
+   All file-and-line references in this document are to that revision.
+
+---
+
+*Prepared 8 August 2026. Line numbers refer to `irixnvme` at `88e99f5`; page numbers refer to
+the PDF editions listed above.*

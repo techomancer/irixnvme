@@ -579,7 +579,10 @@ nvme_ip32_free_replaced_soft(nvme_soft_t *soft)
     /* Free PRP pool */
     nvme_prp_pool_done(soft);
 
-    /* Destroy command tracking locks */
+    /* Destroy command tracking locks and defer ring */
+    soft->shutting_down = 1;
+    nvme_defer_fail_all(soft);
+    nvme_defer_destroy(soft);
     mutex_destroy(&soft->io_requests_lock);
     mutex_destroy(&soft->aborted_lock);
 
@@ -1695,8 +1698,24 @@ nvme_initialize(nvme_soft_t *soft)
      * Initialize I/O command tracking
      * (io_requests and io_cid_bitmap already zeroed by kmem_zalloc)
      */
-    soft->io_cid_free_count = NVME_IO_QUEUE_SIZE;
+    /*
+     * CIDs usable by the SCSI path.  Never more than the SQ can hold
+     * (size - 1) minus a reserve for internal commands, so that a request
+     * whose CIDs were reserved can always be submitted.
+     */
+    soft->io_cid_max = soft->io_queue.size - 1 - NVME_IO_CID_RESERVE;
+    if (soft->io_cid_max > NVME_IO_QUEUE_SIZE)
+        soft->io_cid_max = NVME_IO_QUEUE_SIZE;
+    soft->io_cid_free_count = soft->io_cid_max;
     init_mutex(&soft->io_requests_lock, MUTEX_DEFAULT, "nvme_io_cid", 0);
+
+    /* Deferred request ring + dispatcher state */
+    nvme_defer_init(soft);
+    bzero(&soft->stats, sizeof(soft->stats));
+    soft->stats.io_timeout_sec = NVME_IO_TIMEOUT_MIN_SEC;
+    soft->abort_outstanding = 0;
+    soft->abort_limit = NVME_ABORT_MAX_DEFAULT;
+    soft->shutting_down = 0;
 
     /*
      * Initialize PRP pool for I/O operations
@@ -1997,6 +2016,7 @@ err_free_prp_pool:
     nvme_prp_pool_done(soft);
 
 err_destroy_io_locks:
+    nvme_defer_destroy(soft);
     mutex_destroy(&soft->io_requests_lock);
     mutex_destroy(&soft->io_queue.lock);
 
@@ -2105,6 +2125,10 @@ nvme_shutdown_ex(nvme_soft_t *soft, int fast_alias)
 
     /* Stop timeout watchdog - no more commands should time out */
     nvme_timeout_watchdog_stop(soft);
+
+    /* Nothing new gets started; fail whatever is still parked */
+    soft->shutting_down = 1;
+    nvme_defer_fail_all(soft);
 
     io_wait_ms = fast_alias ? 100 : 5000;
     admin_wait_ms = fast_alias ? 100 : 5000;
@@ -2247,7 +2271,8 @@ nvme_shutdown_ex(nvme_soft_t *soft, int fast_alias)
     /* Free PRP pool */
     nvme_prp_pool_done(soft);
 
-    /* Destroy I/O command tracking lock */
+    /* Destroy I/O command tracking lock and defer ring */
+    nvme_defer_destroy(soft);
     mutex_destroy(&soft->io_requests_lock);
 
     /* Destroy aborted command tracking lock */
@@ -3542,11 +3567,13 @@ nvme_watchdog_stop(nvme_queue_t *q)
 /*
  * nvme_check_timeouts: Check all in-flight commands for timeouts
  *
- * Iterates through all CIDs in the I/O queue and checks if any have exceeded
- * a fixed timeout value (2 seconds).
+ * Iterates through all in-flight CIDs and, for any that has exceeded its
+ * per-request timeout (derived from req->sr_timeout with a floor of
+ * NVME_IO_TIMEOUT_MIN_SEC), issues an NVMe Abort.  Aborts are rate limited
+ * to the controller's ACL so we never flood the admin queue.
  *
- * For timed-out commands, issues an NVMe Abort command and updates the
- * start_time to current lbolt to prevent re-aborting on subsequent checks.
+ * Also checks CSTS.CFS: a controller fatal status is logged loudly because
+ * nothing is going to complete after that.
  *
  * Called from timeout watchdog handler (nvme_timeout_watchdog_handler).
  */
@@ -3554,90 +3581,106 @@ void
 nvme_check_timeouts(nvme_soft_t *soft)
 {
     time_t now = lbolt;
-    const time_t timeout_limit = (2 * HZ);
     nvme_queue_t *q = &soft->io_queue;
     int cid, i;
     scsi_request_t *req;
     time_t elapsed;
     nvme_aborted_cmd_t *entry;
+    nvme_cmd_info_t *ci;
+    uint_t csts;
+    static time_t last_cfs_warn = 0;
 
-    /* Age out stale aborted command entries (older than 1 second) */
+    /* Age out stale aborted command entries */
     mutex_lock(&soft->aborted_lock, PZERO);
     if (soft->aborted_bitmap != 0) {
         for (i = 0; i < NVME_ABORT_FIFO_SIZE; i++) {
-            /* Skip invalid entries */
-            if (!(soft->aborted_bitmap & (1U << i))) {
+            if (!(soft->aborted_bitmap & (1U << i)))
                 continue;
-            }
-
             entry = &soft->aborted_cmds[i];
-
-            /* Check if entry has aged out (older than 1 second) */
-            if ((now - entry->abort_time) > NVME_ABORT_TIMEOUT_TICKS) {
-                /* Clear the stale entry */
+            if ((now - entry->abort_time) > NVME_ABORT_TIMEOUT_TICKS)
                 soft->aborted_bitmap &= ~(1U << i);
-#ifdef NVME_DBG
-                cmn_err(CE_NOTE, "nvme_check_timeouts: aged out stale aborted entry at idx=%u "
-                        "(age %d ms)", i, (int)((now - entry->abort_time) * 1000 / HZ));
-#endif
-            }
         }
     }
     mutex_unlock(&soft->aborted_lock);
 
-    /* Quick check: if no outstanding commands, nothing to do
-     * Use atomicAddInt(ptr, 0) to atomically read with memory barrier */
+    /* Nothing in flight: nothing can time out.  But a parked request may
+     * be waiting for a dispatcher pass that got lost; give it one. */
     if (atomicAddInt((int *)&q->outstanding, 0) == 0) {
+        if (soft->defer_count)
+            nvme_dispatch_deferred(soft);
         return;
+    }
+
+    /* Controller fatal status makes everything below moot */
+    csts = NVME_RD(soft, NVME_REG_CSTS);
+    if (csts & NVME_CSTS_CFS) {
+        if (now - last_cfs_warn > 5 * HZ) {
+            last_cfs_warn = now;
+            cmn_err(CE_WARN, "nvme: ctlr=%d CONTROLLER FATAL STATUS (CSTS=0x%08x) with %d "
+                    "commands outstanding - drive needs a reset (power cycle)",
+                    soft->adap, csts, atomicAddInt((int *)&q->outstanding, 0));
+        }
     }
 
     /* Lock the I/O requests structure while we check */
     mutex_lock(&soft->io_requests_lock, PZERO);
 
-    /* Early exit if all CIDs are free */
-    if (soft->io_cid_free_count == NVME_IO_QUEUE_SIZE) {
+    if (soft->io_cid_free_count == soft->io_cid_max) {
         mutex_unlock(&soft->io_requests_lock);
         return;
     }
 
-    /* Iterate through all possible CIDs with bitmap optimization */
     for (cid = 0; cid < NVME_IO_QUEUE_SIZE; ) {
         uint_t word_idx = cid >> 5u;
         uint_t word = soft->io_cid_bitmap[word_idx];
 
-        /* If entire word is zero (all free), skip 32 CIDs at once */
         if (word == 0) {
             cid += 32;
             continue;
         }
-
-        /* Check individual bit */
         if (!(word & (1u << (cid & 0x1F)))) {
             cid++;
             continue;
         }
 
-        req = soft->io_requests[cid].req;
+        ci = &soft->io_requests[cid];
+        req = ci->req;
+        if (req == NULL) {
+            /* Cannot happen now that slots are initialised under the lock */
+            cid++;
+            continue;
+        }
 
-        /* Check if command has timed out */
-        elapsed = now - soft->io_requests[cid].start_time;
+        elapsed = now - ci->start_time;
 
-        if (elapsed > timeout_limit) {
-            /* Command has timed out */
+        if (elapsed > ci->timeout) {
+            if (!ci->aborted)
+                soft->stats.io_timeouts++;
+
+            /* Respect the controller's abort limit; try the rest next pass */
+            if (atomicAddInt((int *)&soft->abort_outstanding, 0) >= (int)soft->abort_limit) {
+                cid++;
+                continue;
+            }
+
             cmn_err(CE_WARN,
-                    "nvme: ctlr=%d conn=0x%x SN=%.*s CID %d timeout after %d seconds (limit %d seconds)",
-                    soft->adap,
-                    (uint_t)soft->pci_vhdl,
-                    20, soft->serial,
-                    cid, (int)(elapsed / HZ), (int)(timeout_limit / HZ));
+                    "nvme: ctlr=%d SN=%.*s CID %d %s timed out after %d s (limit %d s)%s - aborting",
+                    soft->adap, 20, soft->serial, cid,
+                    (req->sr_flags & SRF_DIR_IN) ? "read" : "write",
+                    (int)(elapsed / HZ), (int)(ci->timeout / HZ),
+                    ci->aborted ? " [again]" : "");
 
-            /* Store in aborted FIFO for retry detection */
+            /* Store in aborted FIFO for retry detection (informational) */
             nvme_aborted_fifo_add(soft, req);
 
-            /* Update start_time to prevent re-aborting this command */
-            soft->io_requests[cid].start_time = now;
+            /* Reset the clock so we don't re-abort every 100 ms */
+            ci->start_time = now;
+            ci->aborted = 1;
 
-            nvme_admin_abort_command(soft, (ushort_t)cid);
+            if (nvme_admin_abort_command(soft, (ushort_t)cid)) {
+                atomicAddInt((int *)&soft->abort_outstanding, 1);
+                soft->stats.io_aborts++;
+            }
         }
 
         cid++;
@@ -3870,6 +3913,14 @@ nvme_ioctl(dev_t dev, int cmd, void *arg, int mode, struct cred *crp, int *rvalp
         if (copyout(&val, (caddr_t)arg, sizeof(int)))
             return EFAULT;
         return 0;
+
+    case NVME_IOC_GET_STATS: {
+        nvme_stats_t st = soft->stats;
+        st.max_transfer_blocks = soft->max_transfer_blocks;
+        if (copyout(&st, (caddr_t)arg, sizeof(st)))
+            return EFAULT;
+        return 0;
+    }
 
     case NVME_IOC_SET_FUA:
         if (copyin((caddr_t)arg, &val, sizeof(int)))

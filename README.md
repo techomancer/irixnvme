@@ -80,6 +80,17 @@ mkfs           # Create filesystem
 
 7. **LOL** (you're now booting IRIX 6.5 from NVMe!)
 
+## Runtime tuning / diagnostics
+
+```csh
+make nvmectl
+./nvmectl 2 stats        # counters + high-water marks (CIDs, PRP pages, timeouts, aborts)
+```
+
+See [CHANGES-heavy-write-fix.md](CHANGES-heavy-write-fix.md) for the
+deferred-request scheduler, per-request timeouts and the other changes made
+to survive sustained large writes (video capture / render scratch use).
+
 ## Tested with
 - PLX and PERICOM PCI-PCIe bridges, (Sedna and Startech on Amazon), the PLX bridges are cheaper on eBay
 - your favorite no name brand passive PCIe-M.2 adapter

@@ -203,6 +203,26 @@ typedef struct _nvme_error_log_entry {
 #define NVME_IOC_SET_VWC    0x4E560002  /* set volatile write cache: 0=off, 1=on */
 #define NVME_IOC_GET_FUA    0x4E560003  /* get Force Unit Access state */
 #define NVME_IOC_SET_FUA    0x4E560004  /* set Force Unit Access: 0=off, 1=on */
+#define NVME_IOC_GET_STATS  0x4E560005  /* get driver statistics (nvme_stats_t) */
+
+/*
+ * Driver statistics returned by NVME_IOC_GET_STATS.
+ * All counters are cumulative since attach.
+ */
+typedef struct nvme_stats {
+    unsigned int io_requests;       /* SCSI READ/WRITE requests accepted */
+    unsigned int io_commands;       /* NVMe Read/Write commands issued */
+    unsigned int io_deferred;       /* requests that had to wait for resources */
+    unsigned int io_defer_full;     /* requests bounced (ST_BUSY) because defer ring full */
+    unsigned int io_timeouts;       /* commands that exceeded their timeout */
+    unsigned int io_aborts;         /* NVMe Abort commands issued */
+    unsigned int io_errors;         /* commands completed with non-success status */
+    unsigned int cid_max_used;      /* high-water mark of CIDs in flight */
+    unsigned int prp_max_used;      /* high-water mark of PRP list pages in use */
+    unsigned int defer_max_depth;   /* high-water mark of defer ring depth */
+    unsigned int max_transfer_blocks; /* per-command block limit in effect */
+    unsigned int io_timeout_sec;    /* per-command timeout in effect (seconds) */
+} nvme_stats_t;
 
 /*
  * Queue sizes and scatter-gather limits
@@ -265,7 +285,10 @@ typedef struct _nvme_identify_controller {
     uchar_t ieee_oui[3];                /* Offset 73-75: IEEE OUI Identifier */
     uchar_t cmic;                       /* Offset 76: Controller Multi-Path I/O and Namespace Sharing Capabilities */
     uchar_t mdts;                       /* Offset 77: MDTS - Maximum Data Transfer Size (2^n pages, 0=unlimited) */
-    uchar_t reserved1[438];             /* Offset 78-515 */
+    uchar_t reserved1a[180];            /* Offset 78-257 */
+    uchar_t acl;                        /* Offset 258: ACL - Abort Command Limit (0-based) */
+    uchar_t aerl;                       /* Offset 259: AERL - Async Event Request Limit (0-based) */
+    uchar_t reserved1b[256];            /* Offset 260-515 */
     __uint32_t number_of_namespaces;    /* Offset 516 (NN field) */
     __uint32_t oncs;                    /* Offset 520: Optional NVM Command Support (in LE bottom) */
     uchar_t reserved2[3572];            /* Offset 524-4095 (rest of 4096 byte structure) */

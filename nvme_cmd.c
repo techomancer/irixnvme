@@ -24,12 +24,19 @@ nvme_submit_cmd(nvme_soft_t *soft, nvme_queue_t *q, nvme_command_t *cmd)
     /* Calculate next tail position */
     next_tail = (q->sq_tail + 1) & q->size_mask;
 
-    /* Check if queue is full - we can't let tail catch up to head */
-    if (next_tail == q->sq_head) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_submit_cmd: queue %d is full (head=%d, tail=%d)",
-                q->qid, q->sq_head, q->sq_tail);
-#endif
+    /*
+     * Full check.  We deliberately do NOT use the SQ Head value the
+     * controller reports in completion entries: a single bogus SQHD (seen
+     * on a MAXIO-based Patriot P300) left sq_head == sq_tail + 1 with
+     * nothing in flight, the ring looked permanently full, and since no
+     * command could be submitted no completion ever arrived to correct
+     * it.  'outstanding' is maintained by the driver itself (incremented
+     * here, decremented per completion) and is the true number of ring
+     * slots in use.  A ring of N entries holds at most N-1 commands.
+     */
+    if ((uint_t)atomicAddInt((int *)&q->outstanding, 0) >= q->size - 1) {
+        cmn_err(CE_WARN, "nvme_submit_cmd: queue %d is full (outstanding=%d, head=%u, tail=%u)",
+                q->qid, q->outstanding, q->sq_head, q->sq_tail);
         mutex_unlock(&q->lock);
         return -1;
     }
@@ -771,34 +778,46 @@ nvme_get_translated_addr(nvme_soft_t *soft, alenlist_t alenlist, size_t maxlengt
     size_t length;
     size_t page_size = soft->nvme_page_size;
 
+    size_t cursor_pos;
+    size_t offset;
+
     /* Clamp to nvme_page_size — callers may pass chunk_size which can be larger */
     if (maxlength > page_size)
         maxlength = page_size;
 
     /*
-     * On the first fetch, peek at the start VA to find the offset within
-     * the NVMe page and shrink maxlength to cover only the remainder of
-     * that first page.  This matters when nvme_page_size < system page
-     * size (e.g. 4K NVMe on a 16K IRIX system): the alenlist segments are
-     * aligned to the system page size, so without this correction PRP1
-     * would span past the NVMe page boundary.
+     * Every PRP entry except PRP1 must be NVMe-page aligned, and PRP1 may
+     * carry an offset but must not cross the end of its page.  The alenlist
+     * does not know about the NVMe page size (it can be smaller than NBPP
+     * on IP30/IP35, and compacted lists can merge physically contiguous
+     * pages), so a naive alenlist_get(page_size) can hand us a segment that
+     * straddles an NVMe page boundary.
+     *
+     * The old code only corrected this for the very first segment of a
+     * request; for a multi-command request whose buffer is not page
+     * aligned, command 2..N started with a straddling PRP1 and the drive
+     * silently transferred the wrong bytes.
+     *
+     * Fix: fetch, and if the segment straddles a page, rewind the cursor to
+     * where we were and fetch again with the exact remaining-in-page length.
      */
-    if (alenlist_cursor_offset(alenlist, NULL) == 0) {
-        alenaddr_t start_va;
-        size_t dummy;
-        if (alenpair_get(alenlist, &start_va, &dummy) == ALENLIST_SUCCESS) {
-            size_t offset = start_va & (page_size - 1);
-            if (offset != 0) {
-                size_t first_page_remain = page_size - offset;
-                if (maxlength > first_page_remain)
-                    maxlength = first_page_remain;
-            }
-        }
-    }
+    cursor_pos = alenlist_cursor_offset(alenlist, NULL);
 
-    /* Get next entry from alenlist */
     if (alenlist_get(alenlist, NULL, maxlength, &address, &length, 0) != ALENLIST_SUCCESS) {
         return -1;
+    }
+
+    offset = (size_t)(address & (page_size - 1));
+    if (offset != 0 && (offset + length) > page_size) {
+        if (alenlist_cursor_init(alenlist, cursor_pos, NULL) != ALENLIST_SUCCESS) {
+            cmn_err(CE_WARN, "nvme_get_translated_addr: cursor rewind to %u failed",
+                    (uint_t)cursor_pos);
+            return -1;
+        }
+        if (alenlist_get(alenlist, NULL, page_size - offset, &address, &length, 0)
+                != ALENLIST_SUCCESS) {
+            return -1;
+        }
     }
 
     /* Translate to PCI bus address with explicit cast to quiet warnings */
@@ -1082,8 +1101,9 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
         return 0;  /* Success - no PRPs needed */
     }
 
-    /* Calculate chunk size for this command */
-    chunk_size = req->sr_buflen - (ps->cidx * ps->max_transfer_blocks * soft->block_size);
+    /* Calculate chunk size for this command (from the block count actually
+     * being transferred, which may be less than sr_buflen) */
+    chunk_size = (ps->num_blocks - ps->cidx * ps->max_transfer_blocks) * soft->block_size;
     if (chunk_size > ps->max_transfer_blocks * soft->block_size) {
         chunk_size = ps->max_transfer_blocks * soft->block_size;
     }
@@ -1143,6 +1163,7 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
         alenaddr_t prp_phys = 0;
         __uint32_t *prp_list_dwords = NULL;
         uint_t prp_index = soft->nvme_prp_entries-1;  /* Start at max to trigger allocation */
+        nvme_cmd_info_t *ci = &soft->io_requests[ps->cids[ps->cidx]];
 
         /* Walk the alenlist page by page to fill PRP list */
         while (chunk_size > 0) {
@@ -1157,25 +1178,18 @@ nvme_build_prps_from_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 #endif
             /* Check if we need a new PRP list page */
             if (prp_index >= soft->nvme_prp_entries - 1) {
-                /* Allocate PRP list page */
-                pool_index = nvme_prp_pool_alloc(soft);
-                if (pool_index < 0) {
-#ifdef NVME_DBG
-                    cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: no PRP pool pages available (page %d)",
-                            num_prp_pages);
-#endif
-                    /* Resource exhaustion - set BUSY and return -1 for retry */
-                    nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-                    return -1;
-                }
-
-                /* Store PRP page with CID */
-                if (nvme_io_cid_store_prp(soft, ps->cids[ps->cidx], pool_index) != 0) {
-                    cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: failed to store PRP index %d with CID %u",
-                            pool_index, ps->cids[ps->cidx]);
-                    nvme_prp_pool_free(soft, pool_index);
+                /*
+                 * PRP list pages were reserved for this CID in
+                 * nvme_io_reserve() before we got here, so this can only
+                 * fail if the reservation estimate was wrong (a bug).
+                 */
+                if (ci->nprp_used >= ci->nprp) {
+                    cmn_err(CE_WARN, "nvme_build_prps_from_alenlist: CID %u needs more than the %d "
+                            "reserved PRP pages (remaining=%u) - this is a driver bug",
+                            ps->cids[ps->cidx], ci->nprp, chunk_size);
                     return 0;
                 }
+                pool_index = ci->prpidx[ci->nprp_used++];
 
                 /* Calculate addresses for PRP list page */
                 prp_virt = (void *)((caddr_t)soft->prp_pool + (pool_index * soft->nvme_page_size));
@@ -1276,10 +1290,12 @@ nvme_prp_pool_init(nvme_soft_t *soft)
     }
 
     /* Initialize bitmap - all pages available (all bits set to 1) */
-    soft->prp_pool_bitmap = 0xFFFFFFFFFFFFFFFFULL;
-
-    /* Initialize lock */
-    init_mutex(&soft->prp_pool_lock, MUTEX_DEFAULT, "nvme_prp_pool", 0);
+    {
+        int w;
+        for (w = 0; w < NVME_PRP_POOL_WORDS; w++)
+            soft->prp_pool_bitmap[w] = 0xFFFFFFFFu;
+    }
+    soft->prp_pool_free_count = NVME_PRP_POOL_SIZE;
 
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme_prp_pool_init: PRP pool allocated at virt=%p phys=0x%llx",
@@ -1304,100 +1320,168 @@ nvme_prp_pool_done(nvme_soft_t *soft)
 #ifdef NVME_DBG
     cmn_err(CE_NOTE, "nvme_prp_pool_done: freeing PRP pool");
 #endif
-    /* Destroy the mutex */
-    mutex_destroy(&soft->prp_pool_lock);
-
     /* Free the pool memory */
     kvpfree(soft->prp_pool, (int)btop(NVME_PRP_POOL_SIZE * soft->nvme_page_size));
     soft->prp_pool = NULL;
     soft->prp_pool_phys = 0;
-    soft->prp_pool_bitmap = 0;
+    soft->prp_pool_free_count = 0;
 }
 
 /*
- * nvme_prp_pool_alloc: Allocate a PRP list page from the pool
+ * nvme_prp_pool_alloc_locked: Allocate a PRP list page from the pool
  *
- * Finds an available page in the PRP pool bitmap and marks it as allocated.
+ * Caller must hold soft->io_requests_lock.
  *
  * Returns:
- *   0-63: Index of allocated page
+ *   0..NVME_PRP_POOL_SIZE-1: Index of allocated page
  *   -1: No pages available
  */
 int
-nvme_prp_pool_alloc(nvme_soft_t *soft)
+nvme_prp_pool_alloc_locked(nvme_soft_t *soft)
 {
-    int i;
-    __uint64_t mask;
+    int w, b;
+    __uint32_t word;
 
-    mutex_lock(&soft->prp_pool_lock, PZERO);
-
-    /* Find first empty bit (1 = available, 0 = in use) */
-    for (i = 0; i < NVME_PRP_POOL_SIZE; i++) {
-        mask = 1ULL << i;
-        if (soft->prp_pool_bitmap & mask) {
-            /* Found available page - mark as in use */
-            soft->prp_pool_bitmap &= ~mask;
-            mutex_unlock(&soft->prp_pool_lock);
-            return i;
+    for (w = 0; w < NVME_PRP_POOL_WORDS; w++) {
+        word = soft->prp_pool_bitmap[w];
+        if (word == 0)
+            continue;
+        for (b = 0; b < 32; b++) {
+            if (word & (1u << b)) {
+                soft->prp_pool_bitmap[w] &= ~(1u << b);
+                soft->prp_pool_free_count--;
+                return (w << 5) + b;
+            }
         }
     }
-
-    /* No pages available */
-    mutex_unlock(&soft->prp_pool_lock);
     return -1;
 }
 
 /*
- * nvme_prp_pool_free: Free a PRP list page back to the pool
+ * nvme_prp_pool_free_locked: Return a PRP list page to the pool
  *
- * Marks the specified page as available in the bitmap.
- *
- * Arguments:
- *   soft  - Controller state
- *   index - Page index (0-63)
+ * Caller must hold soft->io_requests_lock.
  */
 void
-nvme_prp_pool_free(nvme_soft_t *soft, int index)
+nvme_prp_pool_free_locked(nvme_soft_t *soft, int index)
 {
-    __uint64_t mask;
-
     if (index < 0 || index >= NVME_PRP_POOL_SIZE) {
-#ifdef NVME_DBG
         cmn_err(CE_WARN, "nvme_prp_pool_free: invalid index %d", index);
-#endif
         return;
     }
-
-    mutex_lock(&soft->prp_pool_lock, PZERO);
-
-    /* Mark page as available (set bit to 1) */
-    mask = 1ULL << index;
-    soft->prp_pool_bitmap |= mask;
-
-    mutex_unlock(&soft->prp_pool_lock);
+    soft->prp_pool_bitmap[index >> 5] |= (1u << (index & 31));
+    soft->prp_pool_free_count++;
 }
 
 /*
- * nvme_io_cid_alloc: Allocate multiple CIDs for I/O commands
+ * nvme_prp_pages_for_bytes: Worst-case number of PRP list pages a single
+ * NVMe command transferring 'bytes' bytes can need.
  *
- * Finds free CID slots in the I/O queue, marks them as allocated,
- * and stores the scsi_request pointer for later retrieval.
- * Stores the reference count in req->sr_ha.
+ * The buffer may start at any offset inside a page, so a transfer of N
+ * bytes can touch ceil(N / page) + 1 pages.  PRP1 covers the first page;
+ * the remainder go in PRP2 (if exactly one) or in PRP list pages holding
+ * (entries - 1) data pointers each (the last entry chains to the next
+ * list page).  We round up conservatively.
+ */
+uint_t
+nvme_prp_pages_for_bytes(nvme_soft_t *soft, uint_t bytes)
+{
+    uint_t page = soft->nvme_page_size;
+    uint_t entries_per_list = soft->nvme_prp_entries - 1;
+    uint_t data_pages;
+
+    if (bytes == 0)
+        return 0;
+    if (soft->nvme_prp_entries < 2) {
+        cmn_err(CE_PANIC, "nvme: nvme_prp_entries=%u is invalid", soft->nvme_prp_entries);
+    }
+
+    data_pages = (bytes + page - 1) / page + 1;   /* +1 for a possible offset */
+    if (data_pages <= 2)
+        return 0;                                  /* PRP1 + PRP2 direct */
+
+    return (data_pages - 1 + entries_per_list - 1) / entries_per_list;
+}
+
+/*
+ * nvme_compute_limits: Derive the per-command transfer limit.
+ *
+ * Called once Identify Controller (MDTS) and Identify Namespace (block
+ * size) have both completed.  The limit is the smaller of:
+ *   - MDTS (in units of CAP.MPSMIN pages), if non-zero
+ *   - what NVME_CMD_MAX_PRPS chained PRP list pages can describe
+ *   - a sanity cap so that mdts==0 drives don't get 32 MB commands
+ *
+ * The original code assumed 512-byte blocks when converting MDTS to
+ * blocks, which is wrong for 4Kn-formatted namespaces and would have
+ * produced commands larger than the drive allows.
+ */
+void
+nvme_compute_limits(nvme_soft_t *soft)
+{
+    uint_t page = soft->nvme_page_size;
+    uint_t max_bytes;
+    uint_t prp_cap_pages;
+    uint_t prp_cap_bytes;
+
+    if (soft->mdts == 0) {
+        max_bytes = 4u * 1024u * 1024u;            /* "unlimited": cap at 4 MB */
+    } else {
+        __uint64_t b = (__uint64_t)(1u << soft->mdts) * (1u << (soft->min_page_size + 12));
+        if (b > 4u * 1024u * 1024u)
+            b = 4u * 1024u * 1024u;
+        max_bytes = (uint_t)b;
+    }
+
+    /* Largest transfer NVME_CMD_MAX_PRPS list pages can describe, minus one
+     * page for a possible start offset. */
+    prp_cap_pages = 1 + NVME_CMD_MAX_PRPS * (soft->nvme_prp_entries - 1) - 1;
+    prp_cap_bytes = prp_cap_pages * page;
+    if (max_bytes > prp_cap_bytes)
+        max_bytes = prp_cap_bytes;
+
+    /* Round down to a whole number of pages */
+    max_bytes &= ~(page - 1);
+    if (max_bytes < page)
+        max_bytes = page;
+
+    soft->max_transfer_bytes = max_bytes;
+    if (soft->block_size == 0)
+        soft->block_size = 512;                    /* identify namespace not done yet */
+    soft->max_transfer_blocks = max_bytes / soft->block_size;
+    soft->stats.max_transfer_blocks = soft->max_transfer_blocks;
+
+    cmn_err(CE_NOTE, "nvme: per-command limit %u KB (%u blocks of %u bytes), "
+            "PRP pool %u pages, CIDs %u",
+            max_bytes / 1024, soft->max_transfer_blocks, soft->block_size,
+            NVME_PRP_POOL_SIZE, soft->io_cid_max);
+}
+
+/*
+ * nvme_io_reserve: Atomically reserve everything a request needs.
+ *
+ * Reserves 'commands' CIDs and the PRP list pages each command may need,
+ * all under io_requests_lock, so that once this succeeds the request can
+ * always be submitted without running out of anything half way through.
  *
  * Bitmap semantics: 0 = free, 1 = occupied
  *
  * Arguments:
- *   soft      - Controller state
- *   req       - SCSI request structure
- *   commands  - Number of CIDs to allocate
- *   cids - Output array to store allocated CIDs (must have space for 'commands' entries)
+ *   soft         - Controller state
+ *   req          - SCSI request structure
+ *   commands     - Number of CIDs to allocate
+ *   prp_per_cmd  - PRP list pages needed by each command except the last
+ *   prp_last_cmd - PRP list pages needed by the last command
+ *   cids         - Output array (must have space for 'commands' entries)
  *
  * Returns:
- *   0 on success (all CIDs allocated)
- *   -1 on failure (not enough free CIDs available, none allocated)
+ *   0 on success (all resources reserved, sr_ha refcount bumped by 'commands')
+ *   -1 if resources are not available right now (nothing allocated)
  */
 int
-nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands, unsigned int *cids)
+nvme_io_reserve(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
+                unsigned int prp_per_cmd, unsigned int prp_last_cmd,
+                unsigned int *cids)
 {
     unsigned int allocated = 0;
     unsigned int word_idx;
@@ -1405,21 +1489,30 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
     unsigned int word;
     unsigned int mask;
     unsigned int cid;
-    int i;
+    unsigned int prp_total;
+    unsigned int used;
+    time_t timeout;
+    int i, k;
 
-    if (commands == 0) {
+    if (commands == 0 || commands > soft->io_cid_max) {
         return -1;
     }
 
+    prp_total = (commands - 1) * prp_per_cmd + prp_last_cmd;
+
+    /* Per-request timeout: what dksc asked for, but never less than our floor */
+    timeout = req->sr_timeout;
+    if (timeout <= 0)
+        timeout = (time_t)NVME_IO_TIMEOUT_DEFAULT_SEC * HZ;
+    if (timeout < (time_t)NVME_IO_TIMEOUT_MIN_SEC * HZ)
+        timeout = (time_t)NVME_IO_TIMEOUT_MIN_SEC * HZ;
+
     mutex_lock(&soft->io_requests_lock, PZERO);
 
-    /* Early rejection: check if we have enough free CIDs */
-    if (soft->io_cid_free_count < commands) {
+    /* Early rejection: check if we have enough of everything */
+    if (soft->io_cid_free_count < commands ||
+        soft->prp_pool_free_count < prp_total) {
         mutex_unlock(&soft->io_requests_lock);
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_io_cid_alloc: insufficient free CIDs (requested %u, available %u)",
-                commands, soft->io_cid_free_count);
-#endif
         return -1;
     }
 
@@ -1427,62 +1520,80 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
     for (word_idx = 0; word_idx < (NVME_IO_QUEUE_SIZE/32) && allocated < commands; word_idx++) {
         word = soft->io_cid_bitmap[word_idx];
 
-        /* If word is all ones, no free slots in this word */
         if (word == 0xFFFFFFFF)
             continue;
 
-        /* Find zero bits (free CIDs) in this word */
         for (bit_idx = 0; bit_idx < 32 && allocated < commands; bit_idx++) {
             mask = 1u << bit_idx;
             if (!(word & mask)) {
-                /* Found a free CID - calculate CID number */
                 cid = ((word_idx << 5u) + bit_idx);
-
-                /* Set the bit to mark as occupied */
+                if (cid >= soft->io_cid_max)
+                    break;
                 soft->io_cid_bitmap[word_idx] |= mask;
-
-                /* Store CID in output array */
                 cids[allocated] = cid;
                 allocated++;
-
-                /* Update the word variable for next iteration */
                 word = soft->io_cid_bitmap[word_idx];
             }
         }
     }
 
-    /* Check if we allocated all requested CIDs */
     if (allocated < commands) {
-        /* Not enough free CIDs - rollback all allocations */
+        /* Should not happen given the free-count check, but be safe */
         for (i = 0; i < allocated; i++) {
             cid = cids[i];
-            word_idx = cid >> 5u;
-            bit_idx = cid & 0x1F;
-            mask = 1u << bit_idx;
-            soft->io_cid_bitmap[word_idx] &= ~mask;
+            soft->io_cid_bitmap[cid >> 5u] &= ~(1u << (cid & 0x1F));
         }
         mutex_unlock(&soft->io_requests_lock);
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_io_cid_alloc: not enough free CIDs (requested %u, found %u)",
+        cmn_err(CE_WARN, "nvme_io_reserve: bitmap/free-count mismatch (requested %u, found %u)",
                 commands, allocated);
-#endif
         return -1;
     }
 
-    /* Decrement free count now that allocation succeeded */
     soft->io_cid_free_count -= commands;
 
-    mutex_unlock(&soft->io_requests_lock);
-
-    /* Initialize all allocated CID slots (outside lock since we own them) */
+    /*
+     * Initialize the CID slots while still holding the lock.  The timeout
+     * scanner walks the bitmap under this lock and dereferences .req; the
+     * old code set .req after unlocking, which let the scanner see a set
+     * bit with a NULL req / stale start_time and abort (or crash on) a
+     * command that had not even been built yet.
+     */
     for (i = 0; i < commands; i++) {
+        nvme_cmd_info_t *ci;
+        unsigned int want = (i == commands - 1) ? prp_last_cmd : prp_per_cmd;
+
         cid = cids[i];
-        soft->io_requests[cid].req = req;
-        soft->io_requests[cid].start_time = lbolt;  /* Record start time for timeout tracking */
-        for (word_idx = 0; word_idx < NVME_CMD_MAX_PRPS; word_idx++) {
-            soft->io_requests[cid].prpidx[word_idx] = -1;
+        ci = &soft->io_requests[cid];
+        ci->req = req;
+        ci->start_time = lbolt;
+        ci->timeout = timeout;
+        ci->aborted = 0;
+        ci->nprp_used = 0;
+        ci->nprp = 0;
+        for (k = 0; k < NVME_CMD_MAX_PRPS; k++)
+            ci->prpidx[k] = -1;
+        for (k = 0; k < want && k < NVME_CMD_MAX_PRPS; k++) {
+            int idx = nvme_prp_pool_alloc_locked(soft);
+            if (idx < 0) {
+                /* free-count said we had enough; treat as a bug but don't die */
+                cmn_err(CE_WARN, "nvme_io_reserve: PRP pool underflow (free=%u)",
+                        soft->prp_pool_free_count);
+                break;
+            }
+            ci->prpidx[k] = idx;
+            ci->nprp++;
         }
     }
+
+    /* High-water marks for nvmectl stats */
+    used = soft->io_cid_max - soft->io_cid_free_count;
+    if (used > soft->stats.cid_max_used)
+        soft->stats.cid_max_used = used;
+    used = NVME_PRP_POOL_SIZE - soft->prp_pool_free_count;
+    if (used > soft->stats.prp_max_used)
+        soft->stats.prp_max_used = used;
+
+    mutex_unlock(&soft->io_requests_lock);
 
     /* Atomically add the number of commands to sr_ha refcount */
     atomicAddInt((int *)&req->sr_ha, commands);
@@ -1491,17 +1602,15 @@ nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
 }
 
 /*
- * nvme_io_cid_done: Free a CID and PRP and retrieve req.
+ * nvme_io_cid_done: Free a CID and its PRP pages and retrieve req.
  *
- * Marks the CID as free and clears the scsi_request pointer.
- * Frees the PRP if attached.
- * Decrements the reference count in req->sr_ha. Only returns the req
- * when the reference count reaches zero (all commands completed).
- * Bitmap semantics: 0 = free, 1 = occupied
+ * Marks the CID as free, returns its PRP list pages to the pool and clears
+ * the scsi_request pointer.  Decrements the reference count in req->sr_ha;
+ * *last is set to 1 when the reference count reaches zero (all commands of
+ * the request are done).
  *
  * Returns:
- *   scsi_request_t* if this was the last CID (refcount reached 0)
- *   NULL if there are still outstanding CIDs for this request
+ *   scsi_request_t* that owned the CID (NULL if the CID was not in use)
  */
 scsi_request_t *
 nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid, int *last)
@@ -1511,69 +1620,57 @@ nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid, int *last)
     unsigned int bit_idx;
     unsigned int mask;
     unsigned int refcount;
+    nvme_cmd_info_t *ci;
     int i;
 
+    if (last)
+        *last = 0;
+
     if (cid >= NVME_IO_QUEUE_SIZE) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_io_cid_free: invalid CID %d", cid);
-#endif
+        cmn_err(CE_WARN, "nvme_io_cid_done: invalid CID %d", cid);
         return NULL;
     }
 
-    word_idx = cid >> 5u;       /* Divide by 32 */
-    bit_idx = cid & 0x1F;       /* Modulo 32 */
+    word_idx = cid >> 5u;
+    bit_idx = cid & 0x1F;
     mask = 1u << bit_idx;
-
-    req = soft->io_requests[cid].req;
-
-    /* Free PRP storage */
-    for (i = 0; i < NVME_CMD_MAX_PRPS; i++) {
-        if (soft->io_requests[cid].prpidx[i] >= 0) {
-            nvme_prp_pool_free(soft, soft->io_requests[cid].prpidx[i]);
-            soft->io_requests[cid].prpidx[i] = -1;
-        }
-    }
+    ci = &soft->io_requests[cid];
 
     mutex_lock(&soft->io_requests_lock, PZERO);
-    /* Clear the scsi_request pointer (must be inside lock to avoid races with timeout check) */
-    soft->io_requests[cid].req = NULL;
-    /* Clear the bit to mark as free */
+
+    if (!(soft->io_cid_bitmap[word_idx] & mask)) {
+        /* Spurious / duplicate completion for a CID that is not in flight */
+        mutex_unlock(&soft->io_requests_lock);
+        return NULL;
+    }
+
+    req = ci->req;
+
+    for (i = 0; i < NVME_CMD_MAX_PRPS; i++) {
+        if (ci->prpidx[i] >= 0) {
+            nvme_prp_pool_free_locked(soft, ci->prpidx[i]);
+            ci->prpidx[i] = -1;
+        }
+    }
+    ci->nprp = 0;
+    ci->nprp_used = 0;
+    ci->req = NULL;
+
     soft->io_cid_bitmap[word_idx] &= ~mask;
-    /* Increment free count */
     soft->io_cid_free_count++;
+
     mutex_unlock(&soft->io_requests_lock);
 
-    /* Atomically decrement reference count and check if this was the last one */
     if (req != NULL) {
-        /* Atomically decrement refcount and get the NEW value */
         refcount = atomicAddInt((int *)&req->sr_ha, -1);
-
 #ifdef NVME_DBG_EXTRA
         cmn_err(CE_NOTE, "nvme_io_cid_done: CID %u done, refcount now %u", cid, refcount);
 #endif
-
-        /* Only return req if all commands are done (refcount reached 0) */
         if (last)
             *last = (refcount == 0);
     }
 
     return req;
-}
-
-/*
- Store PRP index in the array so we can have more than one PRP page for request
-*/
-int
-nvme_io_cid_store_prp(nvme_soft_t *soft, unsigned int cid, int prpidx)
-{
-    int i;
-    for (i = 0; i < NVME_CMD_MAX_PRPS; i++)
-        if (soft->io_requests[cid].prpidx[i] == -1)
-        {
-            soft->io_requests[cid].prpidx[i] = prpidx;
-            return 0;
-        }
-    return -1;
 }
 
 /*

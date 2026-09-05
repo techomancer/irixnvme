@@ -451,47 +451,45 @@ nvme_scsi_mode_sense(nvme_soft_t *soft, scsi_request_t *req)
 }
 
 /*
- * nvme_scsi_sync_cache: Handle SYNC CACHE command
+ * nvme_scsi_start_sync_cache: Handle SYNCHRONIZE CACHE
+ *
+ * NVMe Flush only covers commands that have already completed, so we treat
+ * a SYNC CACHE as a barrier: it is not issued until the I/O queue is empty
+ * (the dispatcher takes care of that via the barrier check below).
+ *
+ * Returns NVME_START_OK or NVME_START_DEFER.
  */
 int
-nvme_scsi_sync_cache(nvme_soft_t *soft, scsi_request_t *req)
+nvme_scsi_start_sync_cache(nvme_soft_t *soft, scsi_request_t *req)
 {
-    nvme_cmd_info_t *cmd_info;
     nvme_command_t cmd;
     unsigned int cid;
     int rc;
 
-    /* Allocate a CID for this I/O command */
-    if (nvme_io_cid_alloc(soft, req, 1, &cid) != 0) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_sync_cache: no free CID available");
-#endif
-        nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-        return -1;
-    }
+    if (atomicAddInt((int *)&soft->io_queue.outstanding, 0) != 0)
+        return NVME_START_DEFER;
 
-    /* Build NVMe FLUSH command */
+    *(volatile int *)&(req->sr_ha) = 1;
+    nvme_set_success(req);
+
+    if (nvme_io_reserve(soft, req, 1, 0, 0, &cid) != 0)
+        return NVME_START_DEFER;
+
     bzero(&cmd, sizeof(cmd));
-
-    /* CDW0: Opcode (7:0), Flags (15:8), CID (31:16) */
     cmd.cdw0 = NVME_CMD_FLUSH | (cid << 16);
-
-    /* Set namespace ID to 1 (we always use namespace 1) */
     cmd.nsid = 1;
 
-    /* Submit the command to the I/O queue */
     rc = nvme_submit_cmd(soft, &soft->io_queue, &cmd);
     if (rc != 0) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_sync_cache: failed to submit flush command");
-#endif
+        cmn_err(CE_WARN, "nvme_scsi_start_sync_cache: submit failed (SQ full?)");
+        nvme_set_adapter_error(req);
         nvme_io_cid_done(soft, cid, NULL);
-        nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-        return -1;
     }
 
-    /* Command submitted successfully - completion will be handled by interrupt */
-    return 0;
+    if (atomicAddInt((int *)&req->sr_ha, -1) == 0)
+        nvme_complete_request(req);
+
+    return NVME_START_OK;
 }
 
 int
@@ -502,14 +500,6 @@ nvme_parse_rw(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
     switch (cdb[0]) {
     case SCSIOP_READ_6:
     case SCSIOP_WRITE_6:
-        /* READ(6)/WRITE(6) format:
-         * Byte 0: Opcode
-         * Byte 1: LBA bits 20-16 (5 bits) in bits 4-0
-         * Byte 2: LBA bits 15-8
-         * Byte 3: LBA bits 7-0
-         * Byte 4: Transfer length (0 = 256 blocks)
-         * Byte 5: Control
-         */
         ps->lba = ((__uint64_t)(cdb[1] & 0x1F) << 16) |
                   ((__uint64_t)cdb[2] << 8) |
                   ((__uint64_t)cdb[3]);
@@ -523,18 +513,6 @@ nvme_parse_rw(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 
     case SCSIOP_READ_10:
     case SCSIOP_WRITE_10:
-        /* READ(10)/WRITE(10) format:
-         * Byte 0: Opcode
-         * Byte 1: Flags
-         * Byte 2: LBA bits 31-24
-         * Byte 3: LBA bits 23-16
-         * Byte 4: LBA bits 15-8
-         * Byte 5: LBA bits 7-0
-         * Byte 6: Reserved
-         * Byte 7: Transfer length bits 15-8
-         * Byte 8: Transfer length bits 7-0
-         * Byte 9: Control
-         */
         ps->lba = ((__uint64_t)cdb[2] << 24) |
                   ((__uint64_t)cdb[3] << 16) |
                   ((__uint64_t)cdb[4] << 8) |
@@ -546,24 +524,6 @@ nvme_parse_rw(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 
     case SCSIOP_READ_16:
     case SCSIOP_WRITE_16:
-        /* READ(16)/WRITE(16) format:
-         * Byte 0: Opcode
-         * Byte 1: Flags
-         * Byte 2: LBA bits 63-56
-         * Byte 3: LBA bits 55-48
-         * Byte 4: LBA bits 47-40
-         * Byte 5: LBA bits 39-32
-         * Byte 6: LBA bits 31-24
-         * Byte 7: LBA bits 23-16
-         * Byte 8: LBA bits 15-8
-         * Byte 9: LBA bits 7-0
-         * Byte 10: Transfer length bits 31-24
-         * Byte 11: Transfer length bits 23-16
-         * Byte 12: Transfer length bits 15-8
-         * Byte 13: Transfer length bits 7-0
-         * Byte 14: Flags
-         * Byte 15: Control
-         */
         ps->lba = ((__uint64_t)cdb[2] << 56) |
                   ((__uint64_t)cdb[3] << 48) |
                   ((__uint64_t)cdb[4] << 40) |
@@ -591,177 +551,398 @@ nvme_parse_rw(nvme_soft_t *soft, nvme_rwcmd_state_t *ps)
 
 
 /*
- * nvme_scsi_read_write: Handle READ/WRITE commands
+ * nvme_scsi_start_rw: Try to start a READ/WRITE request.
+ *
+ * Returns:
+ *   NVME_START_DEFER - resources are not available (or a barrier is
+ *                      pending); NOTHING has been done to the request and
+ *                      the caller must retry later.
+ *   NVME_START_OK    - the request is in flight, or it has been completed
+ *                      with an error status (sr_notify already called).
  */
-void
-nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req)
+int
+nvme_scsi_start_rw(nvme_soft_t *soft, scsi_request_t *req)
 {
     nvme_rwcmd_state_t s;
+    uint_t bytes_per_cmd;
+    uint_t last_bytes;
     int rc;
 
     /* Reject zero-length transfers */
     if (req->sr_buflen == 0) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_read_write: zero-length transfer rejected");
-#endif
         nvme_set_success(req);
         nvme_complete_request(req);
-        return;
+        return NVME_START_OK;
     }
-
-    /* Initialize refcount atomically to 1 (will be incremented by nvme_io_cid_alloc) */
-    *(volatile int *)&(req->sr_ha) = 1;
-
-    /* Initialize SCSI status to success (errors will override this) */
-    nvme_set_success(req);
 
     s.req = req;
     s.buflen = req->sr_buflen;
     s.flags = 0;
+    s.alenlist = NULL;
+    s.alenlist_type = NVME_ALENLIST_SUPPLIED;
     s.max_transfer_blocks = soft->max_transfer_blocks;
+
     if (!nvme_parse_rw(soft, &s)) {
         nvme_set_adapter_error(req);
-        goto error;
+        nvme_complete_request(req);
+        return NVME_START_OK;
     }
 
-    /* Check if this is a retry of an aborted command */
-    if (nvme_aborted_fifo_find_and_remove(soft, &s)) {
-        s.flags |= NF_RETRY;
-        s.max_transfer_blocks = 1;
-        cmn_err(CE_WARN, "nvme_scsi_read_write: RETRY DETECTED buflen=%u buffer=%p bp=%p sr_flags=0x%x nf_flags=0x%x",
-                req->sr_buflen, req->sr_buffer, req->sr_bp, req->sr_flags, s.flags);
+    /* Bounds check against the namespace */
+    if (s.lba + s.num_blocks > soft->num_blocks || s.num_blocks == 0) {
+        cmn_err(CE_WARN, "nvme_scsi_start_rw: LBA %llu + %u blocks out of range (ns has %llu)",
+                s.lba, s.num_blocks, soft->num_blocks);
+        nvme_scsi_set_error(req, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00);
+        nvme_complete_request(req);
+        return NVME_START_OK;
     }
-
-#ifdef NVME_DBG
-    cmn_err(CE_NOTE, "nvme_scsi_read_write: ENTRY buflen=%d buffer=%p flags=0x%x tag=%d",
-            req->sr_buflen, req->sr_buffer, req->sr_flags, req->sr_tag);
-#endif
 
     /*
-     * For ordered or head-of-queue tagged commands, issue a special flush first
-     * to ensure proper ordering semantics. The flush will complete before this
-     * command starts executing.
+     * The SCSI layer's buffer must be large enough for the transfer the
+     * CDB describes; if not, trust the buffer (never DMA past it).
+     */
+    if ((__uint64_t)s.num_blocks * soft->block_size > s.buflen) {
+        s.num_blocks = s.buflen / soft->block_size;
+        if (s.num_blocks == 0) {
+            nvme_set_adapter_error(req);
+            nvme_complete_request(req);
+            return NVME_START_OK;
+        }
+    }
+
+    /*
+     * Ordered / head-of-queue tags: act as a barrier.  NVMe gives no
+     * ordering guarantee between commands in a queue, and the old
+     * "issue a flush first" trick did not wait for anything, so it gave
+     * no ordering either.  We simply refuse to start until the queue has
+     * drained; the dispatcher also holds everything behind us until we
+     * complete (soft->barrier_req).
      */
     if (req->sr_tag == SC_TAG_ORDERED || req->sr_tag == SC_TAG_HEAD) {
-#ifdef NVME_DBG
-        cmn_err(CE_NOTE, "nvme_scsi_read_write: issuing special flush before %s command",
-                req->sr_tag == SC_TAG_ORDERED ? "ordered" : "head-of-queue");
-#endif
-        rc = nvme_cmd_special_flush(soft);
-        if (rc != 0) {
-            cmn_err(CE_WARN, "nvme_scsi_read_write: special flush failed");
-            /* Continue anyway - best effort */
-        }
+        if (atomicAddInt((int *)&soft->io_queue.outstanding, 0) != 0)
+            return NVME_START_DEFER;
     }
 
-    if (req->sr_buflen > s.max_transfer_blocks * soft->block_size) {
-        s.commands = (req->sr_buflen + s.max_transfer_blocks * soft->block_size - 1) / (s.max_transfer_blocks * soft->block_size);
-    } else {
-        s.commands = 1;
+    /* Split into commands no larger than the per-command limit */
+    bytes_per_cmd = s.max_transfer_blocks * soft->block_size;
+    s.commands = (s.num_blocks + s.max_transfer_blocks - 1) / s.max_transfer_blocks;
+    if (s.commands > soft->io_cid_max) {
+        /* A single request larger than the whole queue can describe; this
+         * should be impossible with sane maxdmasz, so treat it as an error
+         * rather than parking it forever. */
+        cmn_err(CE_WARN, "nvme_scsi_start_rw: request of %u blocks needs %u commands (max %u)",
+                s.num_blocks, s.commands, soft->io_cid_max);
+        nvme_set_adapter_error(req);
+        nvme_complete_request(req);
+        return NVME_START_OK;
     }
-    /* Prepare alenlist before allocating CIDs (initializes cursor at offset 0) */
+
+    last_bytes = (s.num_blocks - (s.commands - 1) * s.max_transfer_blocks) * soft->block_size;
+    s.prp_per_cmd  = nvme_prp_pages_for_bytes(soft, bytes_per_cmd);
+    s.prp_last_cmd = nvme_prp_pages_for_bytes(soft, last_bytes);
+
+    /* Initialize refcount to 1 (our own hold); nvme_io_reserve adds 'commands' */
+    *(volatile int *)&(req->sr_ha) = 1;
+
+    /* Reserve CIDs and PRP pages atomically - or bail out untouched */
+    if (nvme_io_reserve(soft, req, s.commands, s.prp_per_cmd, s.prp_last_cmd, s.cids) != 0) {
+        return NVME_START_DEFER;
+    }
+
+    if (req->sr_tag == SC_TAG_ORDERED || req->sr_tag == SC_TAG_HEAD)
+        soft->barrier_req = req;
+
+    soft->stats.io_requests++;
+    soft->stats.io_commands += s.commands;
+
+    /* Initialize SCSI status to success (errors will override this) */
+    nvme_set_success(req);
+
+    /* Purely informational: was this command previously aborted by us? */
+    if (nvme_aborted_fifo_find_and_remove(soft, &s)) {
+        s.flags |= NF_RETRY;
+#ifdef NVME_DBG
+        cmn_err(CE_NOTE, "nvme_scsi_start_rw: retry of a previously aborted command "
+                "(LBA %llu, %u blocks)", s.lba, s.num_blocks);
+#endif
+    }
+
+    /* Build the alenlist that PRP construction walks */
     rc = nvme_prepare_alenlist(soft, &s);
     if (rc <= 0) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_read_write: failed to prepare alenlist");
-#endif
         if (rc == 0)
             nvme_set_adapter_error(req);
-        goto error;
+        /* rc == -1: SC_ALIGN already set */
+        s.cidx = 0;
+        goto error_cleanup_cids;
     }
-    if (!s.alenlist)
-        goto error;
-
-    /* Allocate CID(s) for this I/O command */
-    if (nvme_io_cid_alloc(soft, req, s.commands, s.cids) != 0) {
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_read_write: no free CIDs available (requested %u)", s.commands);
-#endif
-        nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-        goto error_cleanup_alenlist;
+    if (!s.alenlist) {
+        nvme_set_adapter_error(req);
+        s.cidx = 0;
+        goto error_cleanup_cids;
     }
 
-    /* Process each command/CID */
+    /* Build and submit each command */
     for (s.cidx = 0; s.cidx < s.commands; s.cidx++) {
 
-        /* Build the NVMe READ/WRITE command (sets opcode, nsid, LBA, num_blocks) */
-#ifdef NVME_DBG_CMD
-        cmn_err(CE_WARN, "nvme_scsi_read_write: building NVMe command %u/%u (CID %u)...", s.cidx+1, s.commands, s.cids[s.cidx]);
-#endif
         rc = nvme_io_build_rw_command(soft, &s);
         if (rc <= 0) {
-#ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to build NVMe command %u", s.cidx);
-#endif
             if (rc == 0)
                 nvme_set_adapter_error(req);
-            goto error_cleanup_cids;
+            goto error_cleanup_cids_alenlist;
         }
-#ifdef NVME_DBG_CMD
-        cmn_err(CE_NOTE, "nvme_scsi_read_write: NVMe command %u built successfully", s.cidx);
-#endif
 
-        /* Build PRP entries for data transfer (sets prp1/prp2, allocates PRP list if needed) */
-#ifdef NVME_DBG_CMD
-        cmn_err(CE_NOTE, "nvme_scsi_read_write: building PRPs for command %u...", s.cidx);
-#endif
         rc = nvme_build_prps_from_alenlist(soft, &s);
         if (rc <= 0) {
-#ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to build PRPs for command %u (rc=%d)", s.cidx, rc);
-#endif
-            if (rc == 0) {
-                /* Hard error - set adapter error */
-                nvme_set_adapter_error(req);
-            }
-            /* rc == -1: BUSY already set by nvme_build_prps_from_alenlist */
-            goto error_cleanup_cids;
+            nvme_set_adapter_error(req);
+            goto error_cleanup_cids_alenlist;
         }
 #ifdef NVME_DBG_CMD
-        cmn_err(CE_NOTE, "nvme_scsi_read_write: PRPs built successfully for command %u, prp1=0x%x%08x prp2=0x%x%08x blocks=%u",
-                s.cidx, s.cmd.prp1_hi, s.cmd.prp1_lo, s.cmd.prp2_hi, s.cmd.prp2_lo, s.cmd.cdw12+1);
-#endif
-        /* Submit the command to the I/O queue */
-#ifdef NVME_DBG_CMD
-        cmn_err(CE_WARN, "nvme_scsi_read_write: submitting NVMe command %u/%u (CID=%d)...", s.cidx+1, s.commands, s.cids[s.cidx]);
+        cmn_err(CE_NOTE, "nvme_scsi_start_rw: cmd %u/%u CID %u prp1=0x%x%08x prp2=0x%x%08x blocks=%u",
+                s.cidx+1, s.commands, s.cids[s.cidx],
+                s.cmd.prp1_hi, s.cmd.prp1_lo, s.cmd.prp2_hi, s.cmd.prp2_lo, s.cmd.cdw12+1);
 #endif
         rc = nvme_submit_cmd(soft, &soft->io_queue, &s.cmd);
         if (rc != 0) {
-#ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_scsi_read_write: failed to submit command %u", s.cidx);
-#endif
-            nvme_set_adapter_status(req, SC_REQUEST, ST_BUSY);
-            goto error_cleanup_cids;
+            /*
+             * Should not happen (CIDs <= SQ size - reserve).  If nothing of
+             * this request has been submitted yet, give everything back
+             * and let the request wait in the ring rather than failing it.
+             */
+            if (s.cidx == 0) {
+                unsigned int j;
+                cmn_err(CE_WARN, "nvme_scsi_start_rw: SQ full before first command "
+                        "(outstanding=%d) - deferring request", soft->io_queue.outstanding);
+                nvme_cleanup_alenlist(soft, &s);
+                for (j = 0; j < s.commands; j++)
+                    nvme_io_cid_done(soft, s.cids[j], NULL);
+                if (soft->barrier_req == req)
+                    soft->barrier_req = NULL;
+                /* sr_ha is back to 1 (our hold); nothing else touched */
+                return NVME_START_DEFER;
+            }
+            cmn_err(CE_WARN, "nvme_scsi_start_rw: submission queue full with reserved CIDs "
+                    "(cmd %u/%u) - driver bug", s.cidx, s.commands);
+            nvme_set_adapter_error(req);
+            goto error_cleanup_cids_alenlist;
         }
-#ifdef NVME_DBG_CMD
-        cmn_err(CE_WARN, "nvme_scsi_read_write: command %u/%u submitted to SQ, tail now at %d", s.cidx+1, s.commands, soft->io_queue.sq_tail);
-#endif
     }
 
+    nvme_cleanup_alenlist(soft, &s);
+    goto out;
+
+error_cleanup_cids_alenlist:
+    nvme_cleanup_alenlist(soft, &s);
 error_cleanup_cids:
     {
         unsigned int j;
-        /* Clean up all allocated CIDs */
+        /* Release the CIDs we never submitted. Submitted ones complete normally. */
         for (j = s.cidx; j < s.commands; j++) {
             nvme_io_cid_done(soft, s.cids[j], NULL);
         }
     }
-error_cleanup_alenlist:
-    /* Clean up alenlist */
-    nvme_cleanup_alenlist(soft, &s);
 
-error:
-    /* Atomically decrement refcount by 1 (for the initial +1 at start) */
-    /* If refcount reaches 0, all commands completed before we got here - call sr_notify
-     * sr_ha is already 0 (NULL) from the atomic decrement
-     */
+out:
+    /* Drop our own hold; if everything already completed (or nothing was
+     * submitted), finish the request here. */
     if (atomicAddInt((int *)&req->sr_ha, -1) == 0) {
-        /* All commands already completed - notify now
-         * Note: sr_ha is already NULL from the atomic decrement, but
-         * nvme_complete_request() will set it again for consistency
-         */
+        if (soft->barrier_req == req)
+            soft->barrier_req = NULL;
         nvme_complete_request(req);
     }
+    return NVME_START_OK;
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * Deferred request ring and dispatcher
+ * ---------------------------------------------------------------------
+ *
+ * All READ/WRITE/SYNC_CACHE requests go through the ring, always, so that
+ * ordering between requests is preserved and there is exactly one code
+ * path that starts I/O.  A request is popped from the ring only after it
+ * has been successfully started; if the head cannot start (no CIDs, no
+ * PRP pages, barrier pending) the dispatcher stops and waits for the next
+ * completion to kick it again.
+ */
+
+void
+nvme_defer_init(nvme_soft_t *soft)
+{
+    soft->defer_head = 0;
+    soft->defer_tail = 0;
+    soft->defer_count = 0;
+    soft->dispatching = 0;
+    soft->dispatch_pending = 0;
+    soft->barrier_req = NULL;
+    init_mutex(&soft->defer_lock, MUTEX_DEFAULT, "nvme_defer", 0);
+}
+
+void
+nvme_defer_destroy(nvme_soft_t *soft)
+{
+    mutex_destroy(&soft->defer_lock);
+}
+
+/*
+ * Returns 0 on success, -1 if the ring is full.
+ */
+int
+nvme_defer_enqueue(nvme_soft_t *soft, scsi_request_t *req)
+{
+    mutex_lock(&soft->defer_lock, PZERO);
+    if (soft->defer_count >= NVME_DEFER_QUEUE_SIZE) {
+        mutex_unlock(&soft->defer_lock);
+        return -1;
+    }
+    soft->defer_ring[soft->defer_tail] = req;
+    soft->defer_tail = (soft->defer_tail + 1) % NVME_DEFER_QUEUE_SIZE;
+    soft->defer_count++;
+    if (soft->defer_count > soft->stats.defer_max_depth)
+        soft->stats.defer_max_depth = soft->defer_count;
+    mutex_unlock(&soft->defer_lock);
+    return 0;
+}
+
+static scsi_request_t *
+nvme_defer_peek(nvme_soft_t *soft)
+{
+    scsi_request_t *req = NULL;
+
+    mutex_lock(&soft->defer_lock, PZERO);
+    if (soft->defer_count > 0)
+        req = soft->defer_ring[soft->defer_head];
+    mutex_unlock(&soft->defer_lock);
+    return req;
+}
+
+static void
+nvme_defer_pop(nvme_soft_t *soft)
+{
+    mutex_lock(&soft->defer_lock, PZERO);
+    if (soft->defer_count > 0) {
+        soft->defer_ring[soft->defer_head] = NULL;
+        soft->defer_head = (soft->defer_head + 1) % NVME_DEFER_QUEUE_SIZE;
+        soft->defer_count--;
+    }
+    mutex_unlock(&soft->defer_lock);
+}
+
+/*
+ * nvme_scsi_try_start: start one request; NVME_START_OK or NVME_START_DEFER
+ */
+static int
+nvme_scsi_try_start(nvme_soft_t *soft, scsi_request_t *req)
+{
+    /* A barrier request is in flight: everything waits behind it */
+    if (soft->barrier_req != NULL && soft->barrier_req != req)
+        return NVME_START_DEFER;
+
+    switch (req->sr_command[0]) {
+    case SCSIOP_READ_6:
+    case SCSIOP_READ_10:
+    case SCSIOP_READ_16:
+    case SCSIOP_WRITE_6:
+    case SCSIOP_WRITE_10:
+    case SCSIOP_WRITE_16:
+        return nvme_scsi_start_rw(soft, req);
+
+    case SCSIOP_SYNC_CACHE:
+        return nvme_scsi_start_sync_cache(soft, req);
+
+    default:
+        /* Should never be parked; fail it so it does not sit forever */
+        cmn_err(CE_WARN, "nvme_scsi_try_start: unexpected opcode 0x%x in defer ring",
+                req->sr_command[0]);
+        nvme_set_adapter_error(req);
+        nvme_complete_request(req);
+        return NVME_START_OK;
+    }
+}
+
+/*
+ * nvme_dispatch_deferred: run the dispatcher.
+ *
+ * Safe to call from any context that may take mutexes (strategy routines,
+ * interrupt threads, timeout threads).  Only one thread runs the loop at a
+ * time; others just register a "pending" kick and leave.  The exit race
+ * (a kick arriving while the running thread is on its way out) is closed
+ * by re-checking dispatch_pending after clearing 'dispatching'.
+ */
+void
+nvme_dispatch_deferred(nvme_soft_t *soft)
+{
+    scsi_request_t *req;
+    int seen;
+    int rc;
+    int started_any = 0;
+
+    atomicAddInt((int *)&soft->dispatch_pending, 1);
+
+    for (;;) {
+        if (!compare_and_swap_int((int *)&soft->dispatching, 0, 1))
+            return;                 /* someone else is running it */
+
+        if (soft->shutting_down) {  /* nvme_defer_fail_all owns the ring now */
+            soft->dispatching = 0;
+            return;
+        }
+
+        seen = atomicAddInt((int *)&soft->dispatch_pending, 0);
+
+        while ((req = nvme_defer_peek(soft)) != NULL) {
+            rc = nvme_scsi_try_start(soft, req);
+            if (rc == NVME_START_DEFER) {
+                if (!started_any)
+                    soft->stats.io_deferred++;
+                break;
+            }
+            started_any = 1;
+            nvme_defer_pop(soft);
+        }
+
+        soft->dispatching = 0;
+
+        /* Did anybody kick us while we were finishing? */
+        if (atomicAddInt((int *)&soft->dispatch_pending, 0) == seen)
+            return;
+        /* yes: go around again */
+    }
+}
+
+/*
+ * nvme_defer_fail_all: complete every parked request with an error.
+ * Used on shutdown/detach so nothing is leaked.
+ */
+void
+nvme_defer_fail_all(nvme_soft_t *soft)
+{
+    scsi_request_t *req;
+    int spins = 0;
+
+    /* Take the dispatcher slot so no one else can peek/pop concurrently.
+     * Callers set soft->shutting_down first, so a running dispatcher exits
+     * promptly. */
+    while (!compare_and_swap_int((int *)&soft->dispatching, 0, 1)) {
+        us_delay(1000);
+        if (++spins > 5000) {
+            cmn_err(CE_WARN, "nvme_defer_fail_all: dispatcher did not release after 5s");
+            return;
+        }
+    }
+
+    for (;;) {
+        req = nvme_defer_peek(soft);
+        if (!req)
+            break;
+        nvme_defer_pop(soft);
+        nvme_set_adapter_status(req, SC_HARDERR, ST_CHECK);
+        req->sr_ha = NULL;
+        if (req->sr_notify)
+            (*req->sr_notify)(req);
+    }
+
+    soft->dispatching = 0;
 }
 
 /*
@@ -850,26 +1031,51 @@ nvme_scsi_command(scsi_request_t *req)
     case SCSIOP_READ_6:
     case SCSIOP_READ_10:
     case SCSIOP_READ_16:
-#ifdef NVME_DBG
-        cmn_err(CE_NOTE, "nvme_scsi_command: READ command - calling read_write handler");
-#endif
-        nvme_scsi_read_write(soft, req);
-        return; // notify always called by nvme_scsi_read_write
     case SCSIOP_WRITE_6:
     case SCSIOP_WRITE_10:
     case SCSIOP_WRITE_16:
-#ifdef NVME_DBG
-        cmn_err(CE_WARN, "nvme_scsi_command: WRITE command - calling read_write handler");
-#endif
-        nvme_scsi_read_write(soft, req);
-        return; // notify always called by nvme_scsi_read_write
+    case SCSIOP_SYNC_CACHE:
+        /*
+         * Asynchronous commands.  Park in the ring and run the dispatcher;
+         * sr_notify is called from the completion path (or immediately by
+         * the start function on a hard error).  If the ring is full we
+         * return a plain SCSI BUSY, which dksc retries after a delay.
+         */
+        if (!soft->initialized || soft->shutting_down) {
+            nvme_set_adapter_error(req);
+            goto done;
+        }
+        /*
+         * A request that hands us a raw *user* virtual address (SRF_MAP /
+         * SRF_MAPUSER without SRF_ALENLIST - dsreq-style ioctls) can only
+         * be translated in the context of the process that owns it, so it
+         * must not be started later from an interrupt thread.  Start it
+         * right here or ask the caller to retry.  Normal dksc I/O arrives
+         * as SRF_MAPBP or SRF_ALENLIST (physical addresses) and is context
+         * independent.
+         */
+        if (!(req->sr_flags & (SRF_ALENLIST | SRF_MAPBP)) &&
+            req->sr_buffer && IS_KUSEG(req->sr_buffer)) {
+            if (soft->barrier_req == NULL && soft->defer_count == 0) {
+                int src = (opcode == SCSIOP_SYNC_CACHE)
+                          ? nvme_scsi_start_sync_cache(soft, req)
+                          : nvme_scsi_start_rw(soft, req);
+                if (src == NVME_START_OK)
+                    return;
+            }
+            nvme_set_adapter_status(req, SC_GOOD, ST_BUSY);
+            goto done;
+        }
+        if (nvme_defer_enqueue(soft, req) != 0) {
+            soft->stats.io_defer_full++;
+            nvme_set_adapter_status(req, SC_GOOD, ST_BUSY);
+            goto done;
+        }
+        nvme_dispatch_deferred(soft);
+        return;
 
     case SCSIOP_MODE_SENSE_6:
         rc = nvme_scsi_mode_sense(soft, req);
-        break;
-
-    case SCSIOP_SYNC_CACHE:
-        rc = nvme_scsi_sync_cache(soft, req);
         break;
 
     default:

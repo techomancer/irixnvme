@@ -89,10 +89,19 @@ nvme_read_completion(nvme_completion_t *cpl, nvme_queue_t *q)
 #ifdef IP30
     heart_dcache_inval((caddr_t)src, sizeof(nvme_completion_t));
 #endif
-    dest[0] = NVME_MEMRD(&src[0]);
-    dest[1] = NVME_MEMRD(&src[1]);
-    dest[2] = NVME_MEMRD(&src[2]);
+    /*
+     * The controller writes DW0..DW2 first and DW3 (which carries the
+     * phase bit) last.  We therefore read DW3 FIRST; only if the phase
+     * bit says the entry is new are DW0..DW2 guaranteed to be new too.
+     * The old order (DW0..DW3) could observe a fresh DW3 together with a
+     * stale DW2 (SQ head) / DW0 (result) if the entry landed between the
+     * reads - the 2 ms watchdog polls the CQ constantly, so the window
+     * gets hit under sustained I/O.
+     */
     dest[3] = NVME_MEMRD(&src[3]);
+    dest[2] = NVME_MEMRD(&src[2]);
+    dest[1] = NVME_MEMRD(&src[1]);
+    dest[0] = NVME_MEMRD(&src[0]);
 }
 
 /*
@@ -119,15 +128,41 @@ nvme_process_completions(nvme_soft_t *soft, nvme_queue_t *q)
             break;  /* No more completions */
         }
 
-        /* Extract SQ Head from completion (dw2 bits 15:0) */
+        /*
+         * Belt and braces: DW3 was read first, but if the entry landed
+         * between our DW3 read and the DW2..DW0 reads, DW0..DW2 are the
+         * new values anyway (they were written before DW3).  Nothing more
+         * to do here; kept as a comment so nobody "optimises" the read
+         * order back.
+         */
+
+        /*
+         * Extract SQ Head from completion (dw2 bits 15:0).  This is kept
+         * for diagnostics only - flow control uses q->outstanding (see
+         * nvme_submit_cmd).  Sanity-check it: the controller cannot have
+         * consumed entries we have not submitted, so a head that lies
+         * outside (old_head .. tail] is a controller/bridge data problem
+         * worth knowing about.
+         */
         sq_head = cpl.dw2 & 0xFFFF;
-        if (sq_head >= q->size) {
-#ifdef NVME_DBG
-            cmn_err(CE_WARN, "nvme_process_completions: weird SQ_HEAD %d it should wraparound",
-                    sq_head);
-#endif
+        {
+            uint_t old_head = q->sq_head;
+            uint_t consumed_ok = (q->sq_tail - old_head) & q->size_mask;   /* entries the ctlr may consume */
+            uint_t consumed    = (sq_head - old_head) & q->size_mask;
+            static time_t last_sqhd_warn = 0;
+
+            if (sq_head >= q->size || consumed > consumed_ok) {
+                if (lbolt - last_sqhd_warn > 10 * HZ) {
+                    last_sqhd_warn = lbolt;
+                    cmn_err(CE_WARN, "nvme: queue %d completion reported SQHD=%u but head=%u tail=%u "
+                            "(outstanding=%d) - ignoring controller SQHD",
+                            q->qid, sq_head, old_head, q->sq_tail, q->outstanding);
+                }
+                /* Do not let a bogus value poison the diagnostic head either */
+            } else {
+                q->sq_head = sq_head & q->size_mask;
+            }
         }
-        q->sq_head = sq_head & q->size_mask;  /* submitters read it, possibly slightly stale */
 
         /* Decrement outstanding command counter */
         atomicAddInt(&q->outstanding, -1);
@@ -177,6 +212,32 @@ nvme_handle_admin_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion
     uint_t lbads;
     int i;
 
+    /*
+     * Abort completions are accounted for first, success or not: the
+     * old code returned early on any failure, so a failed abort (e.g.
+     * "Abort Command Limit Exceeded", or the command had already finished)
+     * was never seen by the abort bookkeeping.
+     */
+    if (NVME_ADMIN_CID_IS_ABORT(cid)) {
+        ushort_t aborted_cid = NVME_ADMIN_CID_GET_ABORTED_CID(cid);
+
+        if (atomicAddInt((int *)&soft->abort_outstanding, -1) < 0)
+            soft->abort_outstanding = 0;
+
+        if (status_code == NVME_SC_SUCCESS) {
+            /* DW0 bit 0 == 1 means the command was NOT aborted (already done) */
+            if (cpl->dw0 & 1) {
+                cmn_err(CE_NOTE, "nvme: abort of CID %d: command had already completed", aborted_cid);
+            } else {
+                cmn_err(CE_NOTE, "nvme: abort of CID %d succeeded", aborted_cid);
+            }
+        } else {
+            cmn_err(CE_NOTE, "nvme: abort of CID %d rejected (status type=%d, code=%d)",
+                    aborted_cid, status_type, status_code);
+        }
+        return;
+    }
+
     if (status_code != NVME_SC_SUCCESS) {
         cmn_err(CE_WARN, "nvme_handle_admin_completion: command failed, "
                 "CID %d, status type %d, code %d",
@@ -209,18 +270,15 @@ nvme_handle_admin_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion
 
         soft->num_namespaces = NVME_MEMRDBS(&id_ctrl->number_of_namespaces);
 
-        /* Get MDTS (Maximum Data Transfer Size) */
+        /* Get MDTS (Maximum Data Transfer Size); the block limit is derived
+         * in nvme_compute_limits() once the namespace block size is known. */
         soft->mdts = id_ctrl->mdts;
+        nvme_compute_limits(soft);
 
-        /* Calculate maximum transfer size in blocks */
-        if (soft->mdts == 0) {
-            /* 0 means no limit - cap at something reasonable */
-            soft->max_transfer_blocks = 0xFFFF;  /* 32MB with 512-byte blocks */
-        } else {
-            /* MDTS is 2^n pages, convert to blocks */
-            uint_t max_pages = (1 << soft->mdts);
-            soft->max_transfer_blocks = (max_pages * (1u << (soft->min_page_size + 12))) / 512;
-        }
+        /* ACL is 0-based: number of Abort commands we may have outstanding */
+        soft->abort_limit = (uint_t)id_ctrl->acl + 1;
+        if (soft->abort_limit > 16)
+            soft->abort_limit = 16;
 
         /* Decode ONCS (Optional NVM Command Support) */
         {
@@ -233,9 +291,8 @@ nvme_handle_admin_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion
 //#ifdef NVME_DBG
         cmn_err(CE_NOTE, "nvme: Controller - SN=%s, Model=%s, FW=%s, NS=%d",
                 soft->serial, soft->model, soft->firmware_rev, soft->num_namespaces);
-        cmn_err(CE_NOTE, "nvme: MDTS=%d (max transfer = %d blocks = %d KB)",
-                soft->mdts, soft->max_transfer_blocks,
-                (soft->max_transfer_blocks * 512) / 1024);
+        cmn_err(CE_NOTE, "nvme: MDTS=%d ACL=%d",
+                soft->mdts, (int)id_ctrl->acl);
         cmn_err(CE_NOTE, "nvme: ONCS - Compare:%d DSM(TRIM):%d Verify:%d",
                 soft->oncs_compare, soft->oncs_dataset_mgmt, soft->oncs_verify);
 //#endif
@@ -267,6 +324,9 @@ nvme_handle_admin_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion
         soft->block_size = 1u << lbads;  /* 2^LBADS */
         soft->lba_shift = lbads;
         soft->nsid = 1;  /* We always use namespace 1 */
+
+        /* Block size is now known: derive the real per-command block limit */
+        nvme_compute_limits(soft);
 
 #ifdef NVME_DBG
         cmn_err(CE_NOTE, "nvme: Namespace 1 - Size=%llu blocks, Block size=%u bytes (2^%u)",
@@ -372,16 +432,6 @@ nvme_handle_admin_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion
             } else {
                 cmn_err(CE_WARN, "nvme: Get Features FID=0x%02x out of range", fid);
             }
-        } else if (NVME_ADMIN_CID_IS_ABORT(cid)) {
-            ushort_t aborted_cid = NVME_ADMIN_CID_GET_ABORTED_CID(cid);
-
-            if (status_code == NVME_SC_SUCCESS) {
-                cmn_err(CE_NOTE, "nvme: abort command succeeded for CID %d", aborted_cid);
-            } else {
-                /* Abort failed - command may have already completed or CID invalid */
-                cmn_err(CE_NOTE, "nvme: abort command failed for CID %d (status type=%d, code=%d)",
-                        aborted_cid, status_type, status_code);
-            }
         } else {
 #ifdef NVME_DBG
             cmn_err(CE_NOTE, "nvme_handle_admin_completion: command CID %d completed", cid);
@@ -485,6 +535,8 @@ nvme_handle_io_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion_t 
 
     /* Check if this is a special CID (not in normal CID range) */
     if (cid == NVME_IO_CID_FLUSH) {
+        /* Internal flush (shutdown path) - may unblock a parked barrier */
+        nvme_dispatch_deferred(soft);
         /* Special flush completion - not tied to any scsi_request */
 #ifdef NVME_DBG
         if (status_code == NVME_SC_SUCCESS) {
@@ -502,7 +554,10 @@ nvme_handle_io_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion_t 
      */
     req = nvme_io_cid_done(soft, cid, &last);
     if (!req) {
-        /* Either spurious completion OR there are still outstanding CIDs for this request */
+        /* Spurious completion (CID not in flight) */
+        cmn_err(CE_WARN, "nvme_handle_io_completion: completion for idle CID %d (status %d/%d)",
+                cid, status_type, status_code);
+        nvme_dispatch_deferred(soft);
         return;
     }
 
@@ -524,21 +579,40 @@ nvme_handle_io_completion(nvme_soft_t *soft, nvme_queue_t *q, nvme_completion_t 
         cmn_err(CE_WARN, "nvme_handle_io_completion: CID %d failed, "
                 "status type %d, code %d", cid, status_type, status_code);
 #endif
+        soft->stats.io_errors++;
         nvme_map_status_to_sense(req, status_type, status_code);
-        if (status_type == 0 && status_code == NVME_SC_INTERNAL) {
-            nvme_aborted_fifo_add(soft, req);
-            nvme_admin_get_log_page_error(soft);
-            cmn_err(CE_NOTE, "nvme_handle_io_completion: CID %d failed with internal error", cid);
+        if (status_type == 0 && status_code == NVME_SC_ABORT_REQ) {
+            /* Our own timeout abort; dksc will retry (SC_CMDTIME) */
+            cmn_err(CE_WARN, "nvme: ctlr=%d CID %d completed as aborted (LBA %u, %s)",
+                    soft->adap, cid,
+                    ((uint_t)req->sr_command[2] << 24) | ((uint_t)req->sr_command[3] << 16) |
+                    ((uint_t)req->sr_command[4] << 8) | req->sr_command[5],
+                    (req->sr_flags & SRF_DIR_IN) ? "read" : "write");
+        } else {
+            cmn_err(CE_WARN, "nvme: ctlr=%d CID %d failed, status type %d code %d",
+                    soft->adap, cid, status_type, status_code);
+            if (status_type == 0 && status_code == NVME_SC_INTERNAL) {
+                nvme_aborted_fifo_add(soft, req);
+                nvme_admin_get_log_page_error(soft);
+            }
         }
     }
 
     /* Notify SCSI layer - this completes the request
-     * sr_ha is already 0 from the atomic decrement, no need to set it again
      * nvme_complete_request() handles cache invalidation for R10K+ CPUs
      */
     if (last) {
+        if (soft->barrier_req == req)
+            soft->barrier_req = NULL;
         nvme_complete_request(req);
     }
+
+    /*
+     * Resources were just freed (a CID and possibly PRP pages, and maybe a
+     * barrier).  Let parked requests have a go.  Cheap when the ring is
+     * empty: one CAS and a peek.
+     */
+    nvme_dispatch_deferred(soft);
 }
 
 #ifdef NVME_TEST

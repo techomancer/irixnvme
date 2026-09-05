@@ -13,6 +13,7 @@
  *   nvmectl <N> get-fua          -- print current FUA state
  *   nvmectl <N> set-fua 0        -- disable Force Unit Access
  *   nvmectl <N> set-fua 1        -- enable Force Unit Access
+ *   nvmectl <N> stats            -- print driver counters / high-water marks
  *
  * <N> is the NVMe adapter number (usually 2 on IP32, matching dks<N>d0).
  */
@@ -34,13 +35,15 @@ static void usage(const char *prog)
             "       %s <adapter> set-vwc 0|1\n"
             "       %s <adapter> get-fua\n"
             "       %s <adapter> set-fua 0|1\n"
+            "       %s <adapter> stats\n"
             "\n"
             "  adapter   NVMe adapter number (e.g. 2 for dks2d0)\n"
             "  get-vwc   print current volatile write cache state\n"
             "  set-vwc   0 = disable write cache, 1 = enable\n"
             "  get-fua   print current Force Unit Access state\n"
-            "  set-fua   0 = disable FUA, 1 = enable\n",
-            prog, prog, prog, prog);
+            "  set-fua   0 = disable FUA, 1 = enable\n"
+            "  stats     print I/O counters, deferrals, timeouts, high-water marks\n",
+            prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -110,6 +113,29 @@ int main(int argc, char *argv[])
             close(fd); return 1;
         }
         rc = do_set(fd, adap, NVME_IOC_SET_FUA, "force unit access", val);
+
+    } else if (strcmp(cmd, "stats") == 0) {
+        nvme_stats_t st;
+        memset(&st, 0, sizeof(st));
+        if (ioctl(fd, NVME_IOC_GET_STATS, &st) != 0) {
+            perror("nvmectl: ioctl(NVME_IOC_GET_STATS)");
+            rc = 1;
+        } else {
+            printf("adapter %d statistics:\n", adap);
+            printf("  SCSI R/W requests accepted : %u\n", st.io_requests);
+            printf("  NVMe R/W commands issued   : %u\n", st.io_commands);
+            printf("  requests deferred (waited) : %u\n", st.io_deferred);
+            printf("  requests bounced BUSY      : %u\n", st.io_defer_full);
+            printf("  command timeouts           : %u\n", st.io_timeouts);
+            printf("  NVMe aborts issued         : %u\n", st.io_aborts);
+            printf("  commands failed            : %u\n", st.io_errors);
+            printf("  CIDs in flight (max)       : %u\n", st.cid_max_used);
+            printf("  PRP list pages used (max)  : %u\n", st.prp_max_used);
+            printf("  defer ring depth (max)     : %u\n", st.defer_max_depth);
+            printf("  per-command block limit    : %u\n", st.max_transfer_blocks);
+            printf("  per-command timeout floor  : %u s\n", st.io_timeout_sec);
+            rc = 0;
+        }
 
     } else {
         fprintf(stderr, "nvmectl: unknown command '%s'\n", cmd);

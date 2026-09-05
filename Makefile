@@ -41,7 +41,15 @@ FUA_CFLAGS=-DNVME_FUA_WRITES
 DISABLE_WC_CFLAGS=
 FUA_CFLAGS=
 #endif
-COMMON_CFLAGS=$(BUILTIN_CFLAGS) $(DISABLE_WC_CFLAGS) $(FUA_CFLAGS)
+# USE_PCI_PIO=1 : on IP32, use the pciio_pio_read32/write32 accessors for
+# all BAR0 register access, as required by the IRIX 6.5 DDPG ch. 21 for O2.
+# Default off (raw volatile access, which is what the driver has always used).
+#if $(USE_PCI_PIO) == "1" && $(CPUBOARD) == "IP32"
+PIO_CFLAGS=-DUSE_PCI_PIO
+#else
+PIO_CFLAGS=
+#endif
+COMMON_CFLAGS=$(BUILTIN_CFLAGS) $(DISABLE_WC_CFLAGS) $(FUA_CFLAGS) $(PIO_CFLAGS)
 
 LDFLAGS_IP35=-nostdlib -64 -mips4
 LDFLAGS_IP30=-nostdlib -64 -mips4

@@ -130,6 +130,44 @@ void bp_heart_invalidate_war(struct buf *bp);
 #define NVME_WATCHDOG_TIMEOUT_US 2000   /* Watchdog timeout in microseconds (2ms) */
 #define NVME_TIMEOUT_CHECK_INTERVAL_MS 100  /* Check for timeouts every 100ms (10 Hz) */
 
+/*
+ * Command timeout policy.
+ *
+ * Consumer NVMe SSDs routinely stall for several seconds during sustained
+ * writes (SLC cache exhaustion, garbage collection, thermal throttling).
+ * The original driver aborted any command that took longer than 2 seconds,
+ * which under heavy video capture/render workloads produced abort storms,
+ * SC_CMDTIME retries and eventually EIO -> XFS forced shutdown.
+ *
+ * We now honour the timeout the SCSI layer asked for (req->sr_timeout,
+ * in ticks) but never go below NVME_IO_TIMEOUT_MIN_SEC.  If sr_timeout is
+ * zero we use NVME_IO_TIMEOUT_DEFAULT_SEC.
+ */
+#define NVME_IO_TIMEOUT_MIN_SEC      30
+#define NVME_IO_TIMEOUT_DEFAULT_SEC  60
+
+/*
+ * Number of CIDs kept back from the SCSI path.  The I/O submission queue
+ * has NVME_IO_QUEUE_SIZE slots but can only hold size-1 entries, and a few
+ * internal commands (shutdown flush) also need slots.  Keeping some CIDs
+ * in reserve guarantees nvme_submit_cmd() never sees a full SQ for a
+ * request whose resources were already reserved.
+ */
+#define NVME_IO_CID_RESERVE     8
+
+/*
+ * Deferred request ring.  When a READ/WRITE/SYNC_CACHE arrives and the
+ * driver cannot reserve CIDs / PRP pages for it, the request is parked
+ * here instead of being bounced back to dksc with a BUSY/REQUEST error.
+ * Completions kick the dispatcher which starts parked requests in FIFO
+ * order.  This is what real HBA drivers do; dksc treats a rejected
+ * request as a hard error which is fatal for XFS metadata writes.
+ */
+#define NVME_DEFER_QUEUE_SIZE   256
+
+/* Maximum concurrently outstanding NVMe Abort commands (overridden by ACL) */
+#define NVME_ABORT_MAX_DEFAULT  4
+
 /* SCSI CDB Operation Codes we handle */
 #define SCSIOP_TEST_UNIT_READY    0x00
 #define SCSIOP_INQUIRY            0x12
@@ -234,7 +272,8 @@ typedef struct nvme_queue_s {
 /*
  * PRP List Pool Configuration
  */
-#define NVME_PRP_POOL_SIZE      64      /* Number of PRP list pages (64 * 4KB = 256KB) */
+#define NVME_PRP_POOL_SIZE      128     /* Number of PRP list pages (must be multiple of 32) */
+#define NVME_PRP_POOL_WORDS     (NVME_PRP_POOL_SIZE / 32)
 
 /*
  * Command Tracking Structure
@@ -243,8 +282,11 @@ typedef struct nvme_queue_s {
 typedef struct nvme_cmd_info {
     scsi_request_t     *req;           /* Associated SCSI request */
     time_t              start_time;    /* lbolt when command was issued */
-    int                 prpidx[NVME_CMD_MAX_PRPS]; /* Index into PRP pool (0-63, -1 if none) */
-    int                 last;
+    time_t              timeout;       /* ticks allowed before we abort */
+    int                 prpidx[NVME_CMD_MAX_PRPS]; /* Index into PRP pool (-1 if none) */
+    int                 nprp;          /* number of PRP pages reserved for this CID */
+    int                 nprp_used;     /* number consumed by PRP list builder */
+    int                 aborted;       /* 1 once an Abort has been issued for this CID */
 } nvme_cmd_info_t;
 
 /*
@@ -284,7 +326,7 @@ typedef struct nvme_soft_s {
     uint_t              max_page_size;
     uint_t              nvme_page_size; /* size used for transfers, ideally matching NBPP */
     uint_t              nvme_page_shift;
-    u_int8_t            nvme_prp_entries; /* number of prp entries in nvme page */
+    uint_t              nvme_prp_entries; /* number of PRP entries in an NVMe page (512 for 4K, 2048 for 16K) */
     uint_t              doorbell_stride; /* Doorbell stride */
 
     /* Queues */
@@ -309,18 +351,38 @@ typedef struct nvme_soft_s {
 #ifdef NVME_UTILBUF_USEDMAP
     pciio_dmamap_t      utility_buffer_dmamap; /* DMA map for utility buffer */
 #endif
-    /* PRP list pool for I/O operations (64 nvme_page_size pages, nvme_prp_entries PRP entries per page) */
-    void               *prp_pool;            /* Virtual address of PRP list pool (64 pages) */
+    /* PRP list pool for I/O operations (NVME_PRP_POOL_SIZE nvme_page_size pages).
+     * Protected by io_requests_lock so that CIDs and PRP pages for a request
+     * are reserved atomically. */
+    void               *prp_pool;            /* Virtual address of PRP list pool */
     alenaddr_t          prp_pool_phys;       /* Physical address of PRP list pool */
     pciio_dmamap_t      prp_pool_dmamap;     /* DMA map for PRP list pool */
-    mutex_t             prp_pool_lock;       /* Lock for PRP pool allocation */
-    __uint64_t          prp_pool_bitmap;     /* Bitmap of available pages (64 bits) */
+    __uint32_t          prp_pool_bitmap[NVME_PRP_POOL_WORDS]; /* 1 = available */
+    uint_t              prp_pool_free_count; /* Number of free PRP pages */
 
     /* I/O Command tracking - indexed by CID */
     nvme_cmd_info_t     io_requests[NVME_IO_QUEUE_SIZE]; /* wrapped SCSI requests + PRP idx by CID */
-    mutex_t             io_requests_lock;    /* Lock for CID allocation */
-    __uint32_t          io_cid_bitmap[NVME_IO_QUEUE_SIZE/32];    /* Bitmap of free CIDs (256 bits = 8x32) */
+    mutex_t             io_requests_lock;    /* Lock for CID + PRP page allocation */
+    __uint32_t          io_cid_bitmap[NVME_IO_QUEUE_SIZE/32];    /* Bitmap of CIDs (1 = in use) */
     uint_t              io_cid_free_count;   /* Number of free CIDs available */
+    uint_t              io_cid_max;          /* Number of CIDs usable for SCSI I/O */
+
+    /* Deferred request ring (see NVME_DEFER_QUEUE_SIZE) */
+    scsi_request_t     *defer_ring[NVME_DEFER_QUEUE_SIZE];
+    uint_t              defer_head;          /* next request to dispatch */
+    uint_t              defer_tail;          /* next free slot */
+    uint_t              defer_count;         /* requests currently parked */
+    mutex_t             defer_lock;          /* protects the ring */
+    volatile int        dispatching;         /* 1 while a thread runs the dispatcher */
+    volatile int        dispatch_pending;    /* bumped by anyone who wants a dispatch pass */
+    scsi_request_t     *barrier_req;         /* ORDERED/HEAD request holding the queue */
+
+    /* NVMe Abort bookkeeping */
+    volatile int        abort_outstanding;   /* Abort commands in flight on admin queue */
+    uint_t              abort_limit;         /* ACL+1 from Identify Controller */
+
+    /* Statistics (see nvme_stats_t) */
+    nvme_stats_t        stats;
 
     /* Pre-allocated alenlist for address/length conversions (avoids dynamic allocation failures) */
     alenlist_t          alenlist;            /* Pre-grown alenlist for buf_to_alenlist/kvaddr/uvaddr conversions */
@@ -328,7 +390,8 @@ typedef struct nvme_soft_s {
 
     /* Controller limits */
     uchar_t             mdts;           /* Maximum Data Transfer Size (2^n pages, 0=unlimited) */
-    uint_t              max_transfer_blocks; /* Maximum transfer in blocks (calculated from MDTS) */
+    uint_t              max_transfer_bytes;  /* Maximum bytes per NVMe command (MDTS + PRP list limit) */
+    uint_t              max_transfer_blocks; /* Maximum transfer in blocks (max_transfer_bytes / block_size) */
 
     /* Namespace information - we and everyone in the world only use ns 1 */
     __uint64_t          num_blocks;     /* Total blocks */
@@ -345,6 +408,7 @@ typedef struct nvme_soft_s {
 
     /* State */
     int                 initialized;
+    volatile int        shutting_down;  /* set at start of shutdown: reject new I/O */
 
     /* Timeout watchdog timer */
     toid_t              timeout_watchdog_id;    /* Timeout ID for timeout checking */
@@ -431,9 +495,15 @@ typedef struct nvme_rwcmd_state_s {
     uint_t max_transfer_blocks;
     uint_t commands;
     uint_t cidx;
+    uint_t prp_per_cmd;     /* PRP list pages reserved for each full-size command */
+    uint_t prp_last_cmd;    /* PRP list pages reserved for the (shorter) last command */
     unsigned int cids[NVME_IO_QUEUE_SIZE];
     nvme_command_t cmd;
 } nvme_rwcmd_state_t;
+
+/* Return values of the request start functions */
+#define NVME_START_OK       0   /* request is in flight, or was completed with an error */
+#define NVME_START_DEFER    1   /* nothing was done; call again when resources free up */
 
 
 int nvme_admin_identify_controller(nvme_soft_t *soft);
@@ -469,12 +539,15 @@ void nvme_cleanup_alenlist(nvme_soft_t *soft, nvme_rwcmd_state_t *ps);
 
 int nvme_prp_pool_init(nvme_soft_t *soft);
 void nvme_prp_pool_done(nvme_soft_t *soft);
-int nvme_prp_pool_alloc(nvme_soft_t *soft);
-void nvme_prp_pool_free(nvme_soft_t *soft, int index);
+int nvme_prp_pool_alloc_locked(nvme_soft_t *soft);
+void nvme_prp_pool_free_locked(nvme_soft_t *soft, int index);
+uint_t nvme_prp_pages_for_bytes(nvme_soft_t *soft, uint_t bytes);
+void nvme_compute_limits(nvme_soft_t *soft);
 
-int nvme_io_cid_alloc(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands, unsigned int *cid_array);
+int nvme_io_reserve(nvme_soft_t *soft, scsi_request_t *req, unsigned int commands,
+                    unsigned int prp_per_cmd, unsigned int prp_last_cmd,
+                    unsigned int *cids);
 scsi_request_t *nvme_io_cid_done(nvme_soft_t *soft, unsigned int cid, int *last);
-int nvme_io_cid_store_prp(nvme_soft_t *soft, unsigned int cid, int prpidx);
 
 int nvme_cmd_special_flush(nvme_soft_t *soft);
 
@@ -511,12 +584,21 @@ void nvme_init_scsi_target_info(nvme_soft_t *soft);
 void nvme_aborted_fifo_add(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_aborted_fifo_find_and_remove(nvme_soft_t *soft, nvme_rwcmd_state_t *ps);
 
-void nvme_scsi_read_write(nvme_soft_t *soft, scsi_request_t *req);
+int nvme_scsi_start_rw(nvme_soft_t *soft, scsi_request_t *req);
+int nvme_scsi_start_sync_cache(nvme_soft_t *soft, scsi_request_t *req);
+
+/* Deferred request ring + dispatcher */
+void nvme_defer_init(nvme_soft_t *soft);
+void nvme_defer_destroy(nvme_soft_t *soft);
+int  nvme_defer_enqueue(nvme_soft_t *soft, scsi_request_t *req);
+void nvme_dispatch_deferred(nvme_soft_t *soft);
+void nvme_defer_fail_all(nvme_soft_t *soft);
+
 int nvme_scsi_inquiry(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_scsi_read_capacity(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_scsi_test_unit_ready(nvme_soft_t *soft, scsi_request_t *req);
 int nvme_scsi_send_diagnostic(nvme_soft_t *soft, scsi_request_t *req);
-int nvme_scsi_sync_cache(nvme_soft_t *soft, scsi_request_t *req);
+
 
 /*
  * Function Prototypes - nvmedrv.c (controller management)
@@ -558,11 +640,26 @@ void nvme_timeout_watchdog_handler(nvme_soft_t *soft);
  * MMIO accesses are automatically byte-swapped by SGI's PCI bridge hardware.
  */
 
+#if defined(IP32) && defined(USE_PCI_PIO)
+/*
+ * The IRIX 6.5 Device Driver Programmer's Guide (ch. 21, "PCI Drivers for
+ * the O2 (IP32) Platform") says all PIO on O2 must go through the
+ * pciio_pio_* accessors, compiled with -DUSE_PCI_PIO.  The driver has
+ * historically used raw volatile loads/stores and works that way; this is
+ * the documented form, selectable with USE_PCI_PIO=1 on the make line.
+ */
+#define NVME_RD(soft, offset) \
+    pciio_pio_read32((volatile uint32_t *)((soft)->bar0 + (offset)))
+
+#define NVME_WR(soft, offset, value) \
+    pciio_pio_write32((uint32_t)(value), (volatile uint32_t *)((soft)->bar0 + (offset)))
+#else
 #define NVME_RD(soft, offset) \
     (*(uint_t volatile *)((soft)->bar0 + (offset)))
 
 #define NVME_WR(soft, offset, value) \
     (*(uint_t volatile *)((soft)->bar0 + (offset)) = (value))
+#endif
 
 /*
  * Utility Macros - NVMe Memory Access (DMA structures)
